@@ -10,6 +10,7 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainDevice "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/device"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp/mediaretry"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/websocket"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
@@ -71,6 +72,13 @@ func handler(ctx context.Context, instance *DeviceInstance, rawEvt any) {
 		handleNewsletterMuteChange(ctx, evt, instance.JID(), client)
 	case *events.CallOffer:
 		handleCallOffer(ctx, evt, chatStorageRepo, instance.JID(), client)
+	case *events.MediaRetry:
+		// Fork-specific: route retry notifications back to the HTTP handler
+		// that requested the retry via POST /message/:id/media-retry. If no
+		// handler is waiting, this is a no-op.
+		if delivered := mediaretry.Deliver(evt); !delivered {
+			log.Debugf("MediaRetry event for %s had no active waiter", evt.MessageID)
+		}
 	}
 
 	instance.UpdateStateFromClient()

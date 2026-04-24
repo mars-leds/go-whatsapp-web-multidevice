@@ -23,6 +23,9 @@ func InitRestMessage(app fiber.Router, service domainMessage.IMessageUsecase) Me
 	app.Post("/message/:message_id/star", rest.StarMessage)
 	app.Post("/message/:message_id/unstar", rest.UnstarMessage)
 	app.Get("/message/:message_id/download", rest.DownloadMedia)
+	// Fork-specific: ask the original sender to re-upload media whose CDN
+	// URL has expired (>30 days old). See FORK_CHANGES.md.
+	app.Post("/message/:message_id/media-retry", rest.MediaRetryMessage)
 	return rest
 }
 

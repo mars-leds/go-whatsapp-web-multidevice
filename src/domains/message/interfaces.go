@@ -17,6 +17,9 @@ type IMessageManagement interface {
 	DeleteMessage(ctx context.Context, request DeleteRequest) (err error)
 	StarMessage(ctx context.Context, request StarRequest) (err error)
 	DownloadMedia(ctx context.Context, request DownloadMediaRequest) (response DownloadMediaResponse, err error)
+	// MediaRetry asks the original sender to re-upload media whose CDN URL
+	// has expired and downloads it via the new DirectPath. Fork-specific.
+	MediaRetry(ctx context.Context, request MediaRetryRequest) (response MediaRetryResponse, err error)
 }
 
 // IMessageUsecase combines all message interfaces

@@ -1887,6 +1887,116 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
 
+  /message/{message_id}/media-retry:
+    post:
+      operationId: mediaRetryMessage
+      tags:
+        - message
+      summary: Re-download expired media via WhatsApp media retry (fork)
+      description: |
+        Fork-specific endpoint. When the regular
+        `/message/{message_id}/download` fails with a 410 because the
+        WhatsApp CDN URL has expired (typically >30 days after upload),
+        this endpoint asks the original sender to re-upload the media
+        using whatsmeow's `SendMediaRetryReceipt` flow. It blocks until
+        the asynchronous `MediaRetry` notification arrives (default 30s),
+        decrypts the new `DirectPath`, downloads the refreshed bytes,
+        and persists them under the same `statics/media/...` layout as
+        `/download`.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - in: path
+          name: message_id
+          schema:
+            type: string
+          required: true
+          description: Message ID whose media should be retried.
+          example: '3EB0123456789ABCDEF'
+        - in: query
+          name: phone
+          schema:
+            type: string
+          required: false
+          description: Chat JID. Also accepted in the JSON body.
+          example: '6289685028129@s.whatsapp.net'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                phone:
+                  type: string
+                  example: '6289685028129@s.whatsapp.net'
+                timeout_seconds:
+                  type: integer
+                  default: 30
+                  description: How long to wait for the MediaRetry notification.
+      responses:
+        '200':
+          description: OK — media retry succeeded and the file was saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: integer
+                    example: 200
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                  results:
+                    type: object
+                    properties:
+                      message_id:
+                        type: string
+                      status:
+                        type: string
+                      media_type:
+                        type: string
+                      filename:
+                        type: string
+                      file_path:
+                        type: string
+                      file_size:
+                        type: integer
+        '400':
+          description: Bad request (missing phone, unsupported media type).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '404':
+          description: Message not found, has no media, or no stored mediaKey.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
+        '502':
+          description: |
+            Sender refused the retry, notification decryption failed, or
+            the refreshed CDN path was rejected.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+        '504':
+          description: Timed out waiting for the media retry notification.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+
   /chats:
     get:
       operationId: listChats
