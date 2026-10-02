@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
@@ -14,17 +15,18 @@ import (
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/websocket"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
-	fiberUtils "github.com/gofiber/fiber/v2/utils"
-	_ "github.com/mattn/go-sqlite3"
+	fiberUtils "github.com/gofiber/utils/v2"
 	"github.com/sirupsen/logrus"
 	"github.com/skip2/go-qrcode"
 	"go.mau.fi/libsignal/logger"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type serviceApp struct {
 	chatStorageRepo domainChatStorage.IChatStorageRepository
 	deviceManager   *whatsapp.DeviceManager
+	loginLocks      sync.Map // device id -> chan struct{}, see lockLogin
 }
 
 func NewAppService(chatStorageRepo domainChatStorage.IChatStorageRepository, deviceManager *whatsapp.DeviceManager) domainApp.IAppUsecase {
@@ -35,6 +37,12 @@ func NewAppService(chatStorageRepo domainChatStorage.IChatStorageRepository, dev
 }
 
 func (service *serviceApp) Login(ctx context.Context, deviceID string) (response domainApp.LoginResponse, err error) {
+	unlock, err := service.lockLogin(ctx, deviceID)
+	if err != nil {
+		return response, err
+	}
+	defer unlock()
+
 	instance, client, err := service.ensureClient(ctx, deviceID)
 	if err != nil {
 		return response, err
@@ -47,6 +55,17 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 
 	// Disconnect first to ensure QR flow starts cleanly.
 	client.Disconnect()
+	instance.ClearPasskeyState()
+
+	// Start every QR login on a fresh client. Disconnect emits no event, so the QR
+	// channel of a previous login stays registered on the client and, once its context
+	// expires, disconnects the next session right after its QR code is shown (#851).
+	if client.Store.ID == nil {
+		instance.SetClient(nil)
+		if instance, client, err = service.ensureClient(ctx, deviceID); err != nil {
+			return response, err
+		}
+	}
 
 	// Use a detached context for the QR channel so the pairing session
 	// survives after the HTTP response is sent. The HTTP request context
@@ -74,7 +93,18 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 	go func() {
 		defer qrCancel()
 		defer close(chImage) // Ensure channel is closed when done
-		for evt := range ch {
+		for {
+			var evt whatsmeow.QRChannelItem
+			select {
+			case item, ok := <-ch:
+				if !ok {
+					return
+				}
+				evt = item
+			case <-qrCtx.Done():
+				// A superseded login's channel is never closed; stop with its QR window.
+				return
+			}
 			response.Code = evt.Code
 			response.Duration = evt.Timeout / time.Second / 2
 			if evt.Event == "code" {
@@ -95,6 +125,9 @@ func (service *serviceApp) Login(ctx context.Context, deviceID string) (response
 					logrus.Warnf("[LOGIN][%s] QR context canceled while sending QR path", deviceID)
 					return
 				}
+			} else if evt.Event == whatsmeow.QRChannelEventPasskeyRequest || evt.Event == whatsmeow.QRChannelEventPasskeyResponse {
+				// Passkey events are broadcast by the global event handler and served via /app/passkey endpoints.
+				logrus.Infof("[LOGIN][%s] passkey pairing event: %s", deviceID, evt.Event)
 			} else {
 				logrus.Errorf("[LOGIN][%s] error when get qrCode %s %v", deviceID, evt.Event, evt.Error)
 			}
@@ -131,6 +164,12 @@ func (service *serviceApp) LoginWithCode(ctx context.Context, deviceID string, p
 		return loginCode, err
 	}
 
+	unlock, err := service.lockLogin(ctx, deviceID)
+	if err != nil {
+		return loginCode, err
+	}
+	defer unlock()
+
 	instance, client, err := service.ensureClient(ctx, deviceID)
 	if err != nil {
 		return loginCode, err
@@ -160,27 +199,125 @@ func (service *serviceApp) LoginWithCode(ctx context.Context, deviceID string, p
 	return loginCode, nil
 }
 
-func (service *serviceApp) Logout(ctx context.Context, deviceID string) error {
+func (service *serviceApp) PasskeyChallenge(_ context.Context, deviceID string) (response domainApp.PasskeyChallengeResponse, err error) {
+	if service.deviceManager == nil {
+		return response, fmt.Errorf("device manager not initialized")
+	}
+
+	instance, ok := service.deviceManager.GetDevice(deviceID)
+	if !ok || instance == nil {
+		return response, fmt.Errorf("device %s not found", deviceID)
+	}
+
+	challenge, code, skipHandoffUX := instance.PasskeyState()
+	response.Status = "none"
+	if challenge != nil {
+		response.Status = "awaiting_response"
+	} else if code != "" {
+		response.Status = "awaiting_confirmation"
+	}
+	response.Challenge = challenge
+	response.Code = code
+	response.SkipHandoffUX = skipHandoffUX
+	return response, nil
+}
+
+func (service *serviceApp) PasskeyResponse(ctx context.Context, deviceID string, assertion *types.WebAuthnResponse) error {
+	if err := validations.ValidatePasskeyResponse(ctx, assertion); err != nil {
+		return err
+	}
+
 	if service.deviceManager == nil {
 		return fmt.Errorf("device manager not initialized")
 	}
 
-	if err := service.deviceManager.PurgeDevice(ctx, deviceID); err != nil {
-		logrus.WithError(err).Warnf("[LOGOUT][%s] purge completed with warnings", deviceID)
+	instance, ok := service.deviceManager.GetDevice(deviceID)
+	if !ok || instance == nil {
+		return fmt.Errorf("device %s not found", deviceID)
+	}
+
+	client := instance.GetClient()
+	if client == nil {
+		return pkgError.ErrWaCLI
+	}
+
+	challenge, _, _ := instance.PasskeyState()
+	if challenge == nil {
+		return fmt.Errorf("no pending passkey pairing request for device %s", deviceID)
+	}
+
+	if !client.IsConnected() {
+		return fmt.Errorf("device %s is not connected, restart login and retry the passkey flow", deviceID)
+	}
+
+	if err := client.SendPasskeyResponse(ctx, assertion); err != nil {
+		logrus.Errorf("[PASSKEY][%s] failed to send passkey response: %v", deviceID, err)
 		return err
 	}
 
-	// Broadcast device removal so UI can refresh without manual polling
+	// The PairPasskeyConfirmation event repopulates the confirmation code shortly after.
+	instance.ClearPasskeyState()
+	return nil
+}
+
+func (service *serviceApp) PasskeyConfirm(ctx context.Context, deviceID string) error {
+	if service.deviceManager == nil {
+		return fmt.Errorf("device manager not initialized")
+	}
+
+	instance, ok := service.deviceManager.GetDevice(deviceID)
+	if !ok || instance == nil {
+		return fmt.Errorf("device %s not found", deviceID)
+	}
+
+	client := instance.GetClient()
+	if client == nil {
+		return pkgError.ErrWaCLI
+	}
+
+	_, code, _ := instance.PasskeyState()
+	if code == "" {
+		return fmt.Errorf("no pending passkey confirmation for device %s", deviceID)
+	}
+
+	if !client.IsConnected() {
+		return fmt.Errorf("device %s is not connected, restart login and retry the passkey flow", deviceID)
+	}
+
+	if err := client.SendPasskeyConfirmation(ctx); err != nil {
+		logrus.Errorf("[PASSKEY][%s] failed to send passkey confirmation: %v", deviceID, err)
+		return err
+	}
+
+	instance.ClearPasskeyState()
+	return nil
+}
+
+func (service *serviceApp) Logout(ctx context.Context, deviceID string) error {
+	if err := validations.ValidateDeviceID(ctx, deviceID); err != nil {
+		return err
+	}
+	if service.deviceManager == nil {
+		return fmt.Errorf("device manager not initialized")
+	}
+
+	if err := service.deviceManager.LogoutDeviceKeepSlot(ctx, deviceID); err != nil {
+		logrus.WithError(err).Warnf("[LOGOUT][%s] logout completed with warnings", deviceID)
+		return err
+	}
+
+	// Broadcast the logout so the UI can refresh without manual polling. The slot is
+	// kept, so the device stays listed (disconnected) and can be re-paired by id.
 	var devices []domainApp.DevicesResponse
 	if list, err := service.FetchDevices(ctx); err == nil {
 		devices = list
 	} else {
-		logrus.WithError(err).Warn("[LOGOUT] failed to fetch devices after purge")
+		logrus.WithError(err).Warn("[LOGOUT] failed to fetch devices after logout")
 	}
 
 	websocket.Broadcast <- websocket.BroadcastMessage{
-		Code:    "DEVICE_REMOVED",
-		Message: fmt.Sprintf("Device %s logged out and removed", deviceID),
+		Code:    "DEVICE_LOGGED_OUT",
+		Message: fmt.Sprintf("Device %s logged out (slot kept)", deviceID),
 		Result: map[string]any{
 			"device_id": deviceID,
 			"devices":   devices,
@@ -258,6 +395,7 @@ func (service *serviceApp) FetchDevices(_ context.Context) (response []domainApp
 		response = append(response, domainApp.DevicesResponse{
 			Name:   name,
 			Device: inst.ID(),
+			JID:    inst.JID(),
 		})
 	}
 
@@ -284,4 +422,22 @@ func (service *serviceApp) ensureClient(ctx context.Context, deviceID string) (*
 	}
 
 	return instance, client, nil
+}
+
+// lockLogin serializes login flows per device. Login swaps an unpaired device's
+// client, which must not happen while an overlapping login is still using it.
+func (service *serviceApp) lockLogin(ctx context.Context, deviceID string) (unlock func(), err error) {
+	value, _ := service.loginLocks.LoadOrStore(deviceID, make(chan struct{}, 1))
+	lock := value.(chan struct{})
+	select {
+	case lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	// select picks randomly when both cases are ready; don't run a cancelled request.
+	if err := ctx.Err(); err != nil {
+		<-lock
+		return nil, err
+	}
+	return func() { <-lock }, nil
 }

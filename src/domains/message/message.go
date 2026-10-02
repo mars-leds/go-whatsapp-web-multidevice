@@ -32,6 +32,10 @@ type MarkAsReadRequest struct {
 	Phone     string `json:"phone" form:"phone"`
 }
 
+// MarkAsPlayedRequest has the same transport fields as a read receipt, but
+// requests WhatsApp's played receipt for an existing voice message.
+type MarkAsPlayedRequest = MarkAsReadRequest
+
 type StarRequest struct {
 	MessageID string `json:"message_id" uri:"message_id"`
 	Phone     string `json:"phone" form:"phone"`
@@ -49,5 +53,6 @@ type DownloadMediaResponse struct {
 	MediaType string `json:"media_type"`
 	Filename  string `json:"filename"`
 	FilePath  string `json:"file_path"`
+	FileURL   string `json:"file_url,omitempty"`
 	FileSize  int64  `json:"file_size"`
 }

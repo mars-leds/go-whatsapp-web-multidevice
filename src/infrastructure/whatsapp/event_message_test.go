@@ -6,8 +6,11 @@ import (
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	"github.com/stretchr/testify/assert"
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -39,6 +42,44 @@ func TestBuildEventPayloadIncludesIsFromMe(t *testing.T) {
 		t.Fatalf("expected is_from_me in payload")
 	} else if isFromMe, ok := value.(bool); !ok || !isFromMe {
 		t.Fatalf("expected is_from_me=true, got %v", value)
+	}
+}
+
+func TestBuildEventPayloadIncludesPreparedPollAndStableBody(t *testing.T) {
+	selected := []string{"Sushi"}
+	hashes := []string{pollOptionHash("Sushi")}
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:   types.NewJID("120363000000", types.GroupServer),
+				Sender: types.NewJID("628222", types.DefaultUserServer),
+			},
+			ID:        "VOTE-1",
+			Timestamp: time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC),
+		},
+		Message: &waE2E.Message{PollUpdateMessage: &waE2E.PollUpdateMessage{}},
+	}
+	poll := &webhookPollPayload{
+		Type:                 "vote",
+		PollID:               "POLL-1",
+		Question:             "Lunch?",
+		SelectedOptions:      &selected,
+		SelectedOptionHashes: &hashes,
+		ResolutionStatus:     pollResolutionResolved,
+	}
+
+	eventType, payload, err := buildEventPayload(context.Background(), nil, evt, poll)
+	if err != nil {
+		t.Fatalf("buildEventPayload: %v", err)
+	}
+	if eventType != EventTypeMessage {
+		t.Fatalf("event type = %q, want %q", eventType, EventTypeMessage)
+	}
+	if payload["poll"] != poll {
+		t.Fatalf("poll payload = %#v, want prepared payload", payload["poll"])
+	}
+	if payload["body"] != "Poll vote: Sushi" {
+		t.Fatalf("body = %v, want stable poll summary", payload["body"])
 	}
 }
 
@@ -77,6 +118,40 @@ func TestBuildEventPayloadRevokedIncludesIsFromMe(t *testing.T) {
 		t.Fatalf("expected is_from_me in payload")
 	} else if isFromMe, ok := value.(bool); !ok || !isFromMe {
 		t.Fatalf("expected is_from_me=true, got %v", value)
+	}
+}
+
+func TestBuildEventPayloadReactionIncludesTargetMessageID(t *testing.T) {
+	evt := reactionEventForTest("reaction-event-1", "MSG100", "\U0001f44d")
+
+	eventType, payload, err := buildEventPayload(context.Background(), nil, evt)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if eventType != EventTypeMessageReaction {
+		t.Fatalf("expected event type %s, got %s", EventTypeMessageReaction, eventType)
+	}
+	if got := payload["reaction"]; got != "\U0001f44d" {
+		t.Fatalf("expected reaction payload, got %v", got)
+	}
+	if got := payload["reacted_message_id"]; got != "MSG100" {
+		t.Fatalf("expected reacted message id MSG100, got %v", got)
+	}
+}
+
+func TestBuildEventPayloadReactionWithoutKeyDoesNotPanic(t *testing.T) {
+	evt := reactionEventForTest("reaction-event-2", "MSG101", "\U0001f44d")
+	evt.Message.ReactionMessage.Key = nil
+
+	eventType, payload, err := buildEventPayload(context.Background(), nil, evt)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if eventType != EventTypeMessageReaction {
+		t.Fatalf("expected event type %s, got %s", EventTypeMessageReaction, eventType)
+	}
+	if _, ok := payload["reacted_message_id"]; ok {
+		t.Fatalf("expected no reacted_message_id when reaction key is missing")
 	}
 }
 
@@ -223,5 +298,271 @@ func TestBuildEventPayloadDocumentWithCaption(t *testing.T) {
 	}
 	if body != "Important document" {
 		t.Fatalf("expected body='Important document', got %v", body)
+	}
+}
+
+func TestBuildEventPayloadQuotedBodyUsesQuotedCaption(t *testing.T) {
+	oldAutoDownload := config.WhatsappAutoDownloadMedia
+	config.WhatsappAutoDownloadMedia = false
+	t.Cleanup(func() {
+		config.WhatsappAutoDownloadMedia = oldAutoDownload
+	})
+
+	tests := []struct {
+		name           string
+		quotedMessage  func(*string) *waE2E.Message
+		wantQuotedBody string
+	}{
+		{
+			name: "uses quoted image caption",
+			quotedMessage: func(caption *string) *waE2E.Message {
+				return &waE2E.Message{
+					ImageMessage: &waE2E.ImageMessage{
+						Caption: caption,
+					},
+				}
+			},
+			wantQuotedBody: "Launch checklist",
+		},
+		{
+			name: "uses quoted document caption",
+			quotedMessage: func(caption *string) *waE2E.Message {
+				return &waE2E.Message{
+					DocumentMessage: &waE2E.DocumentMessage{
+						Caption: caption,
+					},
+				}
+			},
+			wantQuotedBody: "Project brief",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			replyText := "Thanks for the update"
+			quotedCaption := tt.wantQuotedBody
+			evt := &events.Message{
+				Info: types.MessageInfo{
+					MessageSource: types.MessageSource{
+						Chat:     types.NewJID("123", types.DefaultUserServer),
+						Sender:   types.NewJID("456", types.DefaultUserServer),
+						IsFromMe: false,
+					},
+					ID:        "MSG206",
+					Timestamp: time.Date(2026, time.February, 8, 10, 0, 0, 0, time.UTC),
+				},
+				Message: &waE2E.Message{
+					ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+						Text: &replyText,
+						ContextInfo: &waE2E.ContextInfo{
+							StanzaID:      protoString("QUOTE206"),
+							QuotedMessage: tt.quotedMessage(&quotedCaption),
+						},
+					},
+				},
+			}
+
+			eventType, payload, err := buildEventPayload(context.Background(), nil, evt)
+			assert.NoError(t, err)
+			assert.Equal(t, EventTypeMessage, eventType)
+			assert.Contains(t, payload, "quoted_body")
+			assert.Equal(t, tt.wantQuotedBody, payload["quoted_body"])
+		})
+	}
+}
+
+func TestBuildEventPayloadContactIncludesPhoneNumber(t *testing.T) {
+	name := "Alice"
+	vcard := "BEGIN:VCARD\nVERSION:3.0\nN:;Alice;;;\nFN:Alice\nTEL;type=Mobile:+62 812 3456 7890\nEND:VCARD"
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     types.NewJID("123", types.DefaultUserServer),
+				Sender:   types.NewJID("456", types.DefaultUserServer),
+				IsFromMe: false,
+			},
+			ID:        "MSG204",
+			Timestamp: time.Date(2026, time.February, 8, 10, 0, 0, 0, time.UTC),
+		},
+		Message: &waE2E.Message{
+			ContactMessage: &waE2E.ContactMessage{
+				DisplayName: &name,
+				Vcard:       &vcard,
+			},
+		},
+	}
+
+	_, payload, err := buildEventPayload(context.Background(), nil, evt)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	contact, ok := payload["contact"].(webhookContactPayload)
+	if !ok {
+		t.Fatalf("expected contact payload to be webhookContactPayload, got %T", payload["contact"])
+	}
+	if contact.DisplayName != "Alice" {
+		t.Fatalf("expected display name Alice, got %q", contact.DisplayName)
+	}
+	if contact.PhoneNumber != "+62 812 3456 7890" {
+		t.Fatalf("expected phone number from vCard, got %q", contact.PhoneNumber)
+	}
+}
+
+func TestBuildEventPayloadContactsArrayIncludesPhoneNumbers(t *testing.T) {
+	nameOne := "Alice"
+	vcardOne := "BEGIN:VCARD\nVERSION:3.0\nN:;Alice;;;\nFN:Alice\nTEL;type=Mobile:+62 812 3456 7890\nEND:VCARD"
+	nameTwo := "Bob"
+	vcardTwo := "BEGIN:VCARD\nVERSION:3.0\nN:;Bob;;;\nFN:Bob\nTEL;type=Mobile:+62 813 9876 5432\nEND:VCARD"
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     types.NewJID("123", types.DefaultUserServer),
+				Sender:   types.NewJID("456", types.DefaultUserServer),
+				IsFromMe: false,
+			},
+			ID:        "MSG205",
+			Timestamp: time.Date(2026, time.February, 8, 10, 0, 0, 0, time.UTC),
+		},
+		Message: &waE2E.Message{
+			ContactsArrayMessage: &waE2E.ContactsArrayMessage{
+				Contacts: []*waE2E.ContactMessage{
+					{
+						DisplayName: &nameOne,
+						Vcard:       &vcardOne,
+					},
+					{
+						DisplayName: &nameTwo,
+						Vcard:       &vcardTwo,
+					},
+				},
+			},
+		},
+	}
+
+	_, payload, err := buildEventPayload(context.Background(), nil, evt)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	contacts, ok := payload["contacts_array"].([]webhookContactPayload)
+	if !ok {
+		t.Fatalf("expected contacts_array to be []webhookContactPayload, got %T", payload["contacts_array"])
+	}
+	if len(contacts) != 2 {
+		t.Fatalf("expected 2 contacts, got %d", len(contacts))
+	}
+	if contacts[0].PhoneNumber != "+62 812 3456 7890" {
+		t.Fatalf("expected first phone number, got %q", contacts[0].PhoneNumber)
+	}
+	if contacts[1].PhoneNumber != "+62 813 9876 5432" {
+		t.Fatalf("expected second phone number, got %q", contacts[1].PhoneNumber)
+	}
+}
+
+func TestBuildEventPayloadIncludesSenderDisplayName(t *testing.T) {
+	accountJID := types.NewJID("628111111111", types.DefaultUserServer)
+	senderJID := types.NewJID("628123456789", types.DefaultUserServer)
+	contacts := &senderDisplayNameContactGetter{
+		contacts: map[types.JID]types.ContactInfo{
+			senderJID: {
+				Found:    true,
+				FullName: "Saved Contact",
+			},
+		},
+	}
+	client := &whatsmeow.Client{
+		Store: &store.Device{
+			ID:       &accountJID,
+			PushName: "Active Account",
+			Contacts: contacts,
+		},
+	}
+
+	tests := []struct {
+		name      string
+		isFromMe  bool
+		sender    types.JID
+		message   *waE2E.Message
+		wantEvent string
+		wantName  string
+	}{
+		{
+			name:      "message",
+			sender:    senderJID,
+			message:   &waE2E.Message{Conversation: protoString("hello")},
+			wantEvent: EventTypeMessage,
+			wantName:  "Saved Contact",
+		},
+		{
+			name:   "reaction before early return",
+			sender: senderJID,
+			message: &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{
+				Key: &waCommon.MessageKey{
+					RemoteJID: protoString("628100000000@s.whatsapp.net"),
+					ID:        protoString("target-message"),
+				},
+				Text: protoString("👍"),
+			}},
+			wantEvent: EventTypeMessageReaction,
+			wantName:  "Saved Contact",
+		},
+		{
+			name:   "revoke before early return",
+			sender: senderJID,
+			message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+				Type: protoProtocolMessageType(waE2E.ProtocolMessage_REVOKE),
+				Key:  &waCommon.MessageKey{ID: protoString("revoked-message")},
+			}},
+			wantEvent: EventTypeMessageRevoked,
+			wantName:  "Saved Contact",
+		},
+		{
+			name:   "edit before early return",
+			sender: senderJID,
+			message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+				Type: protoProtocolMessageType(waE2E.ProtocolMessage_MESSAGE_EDIT),
+				Key:  &waCommon.MessageKey{ID: protoString("edited-message")},
+				EditedMessage: &waE2E.Message{
+					Conversation: protoString("updated"),
+				},
+			}},
+			wantEvent: EventTypeMessageEdited,
+			wantName:  "Saved Contact",
+		},
+		{
+			name:      "outgoing active account",
+			isFromMe:  true,
+			sender:    accountJID,
+			message:   &waE2E.Message{Conversation: protoString("hello")},
+			wantEvent: EventTypeMessage,
+			wantName:  "Active Account",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			evt := &events.Message{
+				Info: types.MessageInfo{
+					MessageSource: types.MessageSource{
+						Chat:     types.NewJID("628100000000", types.DefaultUserServer),
+						Sender:   tt.sender,
+						IsFromMe: tt.isFromMe,
+					},
+					ID:        "sender-display-name",
+					PushName:  "Live Push",
+					Timestamp: time.Date(2026, time.July, 28, 10, 0, 0, 0, time.UTC),
+				},
+				Message: tt.message,
+			}
+
+			eventType, payload, err := buildEventPayload(context.Background(), client, evt)
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantEvent, eventType)
+			assert.Equal(t, tt.sender.String(), payload["from"])
+			assert.Equal(t, "Live Push", payload["from_name"])
+			assert.Equal(t, tt.wantName, payload["sender_display_name"])
+		})
 	}
 }

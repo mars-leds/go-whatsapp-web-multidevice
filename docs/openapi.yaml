@@ -1,13 +1,21 @@
 openapi: "3.0.0"
 info:
   title: WhatsApp API MultiDevice
-  version: 8.3.1
+  version: 9.0.0
   description: |
     This API is used for sending whatsapp via API.
+
+    The web dashboard is a separate project (gowa-ui); the server downloads its
+    latest release asset and serves it at `/` (or returns a JSON banner when
+    APP_UI_ENABLED=false).
 
     Device scoping:
     - Send `X-Device-Id` on all device-scoped REST calls.
     - WebSocket: connect to `/ws?device_id=<id>`.
+    - WebSocket auth (when basic auth is enabled): browsers cannot set an
+      Authorization header on WebSocket connections, so also pass
+      `&authorization=<base64(user:pass)>` in the query string. Use TLS in
+      production since the credential is visible in the URL.
 servers:
   - url: http://localhost:3000
 tags:
@@ -21,6 +29,8 @@ tags:
     description: Send Message (Text/Image/File/Video).
   - name: message
     description: Message manipulation (revoke/react/update).
+  - name: call
+    description: Call management (reject incoming calls)
   - name: chat
     description: Chat conversations and messaging
   - name: group
@@ -33,6 +43,29 @@ security:
   - basicAuth: []
 
 paths:
+  /health:
+    get:
+      operationId: health
+      tags:
+        - app
+      summary: Health check
+      description: Public health probe registered at `/health`; it is not prefixed by `APP_BASE_PATH`.
+      security: []
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: OK
+        '503':
+          description: Service unavailable
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: Service Unavailable
   /app/login:
     get:
       operationId: appLogin
@@ -81,12 +114,105 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
+  /app/passkey:
+    get:
+      operationId: appPasskeyStatus
+      tags:
+        - app
+      summary: Get pending passkey pairing state
+      description: >
+        Passkey pairing is initiated from the phone during QR login. When the phone requests it,
+        the server sends a WebAuthn challenge which is stored here (also broadcast over the
+        websocket as PASSKEY_REQUEST) until a response is submitted.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasskeyStatusResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /app/passkey/response:
+    post:
+      operationId: appPasskeyResponse
+      tags:
+        - app
+      summary: Submit the WebAuthn assertion for passkey pairing
+      description: >
+        Send the WebAuthn assertion produced for the pending challenge (see GET /app/passkey).
+        The assertion must be produced by an authenticator holding the WhatsApp account's passkey,
+        against WhatsApp's relying-party ID; the payload format matches PublicKeyCredential.toJSON().
+        If the assertion is submitted within the 5-minute handoff window, pairing is confirmed
+        automatically; otherwise a confirmation code is issued (PASSKEY_CONFIRMATION websocket event)
+        and must be confirmed via POST /app/passkey/confirm.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebAuthnAssertion'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericResponse'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /app/passkey/confirm:
+    post:
+      operationId: appPasskeyConfirm
+      tags:
+        - app
+      summary: Confirm the passkey pairing code
+      description: >
+        Confirms that the pairing code from the PASSKEY_CONFIRMATION event was shown to the user
+        and matches the code displayed on the phone. Only needed when skip_handoff_ux is false.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
   /app/logout:
     get:
       operationId: appLogout
       tags:
         - app
-      summary: Remove database and logout
+      summary: Logout the active device (keeps the device slot)
+      description: >-
+        Logs the active device out of WhatsApp and clears its session. The device
+        slot (id and display name) is kept, so it stays listed (disconnected) and
+        can be re-paired under the same id. Use DELETE /devices/{device_id} to remove the slot.
       parameters:
         - $ref: '#/components/parameters/DeviceIdHeader'
       responses:
@@ -183,7 +309,11 @@ paths:
                         description: Whether the device is logged in to WhatsApp
                       device_id:
                         type: string
-                        description: The device ID
+                        description: Session ID registered via POST /devices
+                        example: 'org_2'
+                      jid:
+                        type: string
+                        description: WhatsApp JID of the logged-in account (empty until login)
                         example: '6289685028129@s.whatsapp.net'
         '400':
           description: Bad Request
@@ -191,6 +321,72 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /app/info:
+    get:
+      operationId: appInfo
+      tags:
+        - app
+      summary: Get server metadata
+      description: >
+        Returns server version, base path, media size limits, and enabled
+        features. Requires no device; intended for standalone UIs (gowa-ui)
+        that previously read these values from the embedded dashboard HTML.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: integer
+                    example: 200
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                    example: Fetch app info success
+                  results:
+                    type: object
+                    properties:
+                      version:
+                        type: string
+                        example: 'v9.0.0'
+                      os:
+                        type: string
+                        example: 'GOWA'
+                      base_path:
+                        type: string
+                        example: ''
+                      max_file_size:
+                        type: integer
+                        format: int64
+                        description: Max document upload size in bytes
+                        example: 50000000
+                      max_video_size:
+                        type: integer
+                        format: int64
+                        description: Max video upload size in bytes
+                        example: 100000000
+                      max_image_size:
+                        type: integer
+                        format: int64
+                        description: Max image upload size in bytes
+                        example: 20000000
+                      chatwoot_enabled:
+                        type: boolean
+                        description: Whether Chatwoot integration routes are registered
+                      scheduled_sends:
+                        type: boolean
+                        description: Whether send endpoints accept schedule fields and the /send/schedules routes exist
         '500':
           description: Internal Server Error
           content:
@@ -235,6 +431,22 @@ paths:
                   type: string
                   description: Optional custom device ID. If not provided, one will be generated.
                   example: 'my-custom-device-id'
+                webhook_url:
+                  type: string
+                  description: Optional device-specific webhook URL. If set, events for this device will be sent here instead of the global webhook.
+                  example: 'https://device-webhook.example.com/handler'
+                webhook_secret:
+                  type: string
+                  description: Optional secret used to sign device-specific webhook payloads (HMAC).
+                  example: 'super-secret-key'
+                webhook_events:
+                  type: string
+                  description: Optional comma-separated list of event names to forward to the device-specific webhook. Empty means all events.
+                  example: 'message,message.ack'
+                webhook_insecure_skip_verify:
+                  type: boolean
+                  description: Optional. Skip TLS certificate verification when delivering to the device-specific webhook.
+                  example: false
       responses:
         '200':
           description: OK
@@ -293,7 +505,10 @@ paths:
       tags:
         - device
       summary: Remove a device
-      description: Remove a device from the server (does not logout from WhatsApp)
+      description: >-
+        Remove a device slot from the server. This also logs it out of WhatsApp and
+        clears its session and chat data. To log out while keeping the slot, use the
+        logout endpoint instead.
       parameters:
         - name: device_id
           in: path
@@ -326,8 +541,11 @@ paths:
       operationId: loginDevice
       tags:
         - device
-      summary: Login device with QR code
-      description: Initiate QR code login for a specific device
+      summary: Login a device with QR code
+      description: >-
+        Start QR pairing for a specific device slot and return a link to the QR
+        image to scan. Equivalent to `GET /app/login` with
+        `X-Device-Id: <device_id>`, with the device taken from the path instead.
       parameters:
         - name: device_id
           in: path
@@ -341,7 +559,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LoginResponse'
+                $ref: '#/components/schemas/DeviceLoginResponse'
         '404':
           description: Device not found
           content:
@@ -360,8 +578,11 @@ paths:
       operationId: loginDeviceWithCode
       tags:
         - device
-      summary: Login device with pairing code
-      description: Initiate pairing code login for a specific device
+      summary: Login a device with pairing code
+      description: >-
+        Start pairing-code login for a specific device slot and return the code to
+        enter on the phone. Equivalent to `GET /app/login-with-code` with
+        `X-Device-Id: <device_id>`, with the device taken from the path instead.
       parameters:
         - name: device_id
           in: path
@@ -382,7 +603,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LoginWithCodeResponse'
+                $ref: '#/components/schemas/DeviceLoginWithCodeResponse'
         '404':
           description: Device not found
           content:
@@ -402,7 +623,10 @@ paths:
       tags:
         - device
       summary: Logout device
-      description: Logout a specific device from WhatsApp and remove its session
+      description: >-
+        Logs a specific device out of WhatsApp and clears its session, but keeps the
+        device slot (id and display name) so it can be re-paired under the same id.
+        To remove the slot entirely, use DELETE /devices/{device_id}.
       parameters:
         - name: device_id
           in: path
@@ -485,6 +709,174 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeviceStatusResponse'
+        '404':
+          description: Device not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+
+  /devices/{device_id}/webhook:
+    get:
+      operationId: getDeviceWebhook
+      tags:
+        - device
+      summary: Get device webhook configuration
+      description: Get the webhook configuration for a specific device. Returns empty values if no device-specific webhook is set.
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Device ID
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: integer
+                    example: 200
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                    example: Device webhook retrieved
+                  results:
+                    type: object
+                    properties:
+                      device_id:
+                        type: string
+                        description: The device ID
+                        example: 'my-device'
+                      webhook_url:
+                        type: string
+                        description: The configured webhook URL (empty if not set)
+                        example: 'https://example.com/webhook'
+                      webhook_secret:
+                        type: string
+                        description: Secret used to sign payloads for this device webhook
+                        example: 'super-secret-key'
+                      webhook_events:
+                        type: string
+                        description: Comma-separated event whitelist for this device webhook
+                        example: 'message,message.ack'
+                      webhook_insecure_skip_verify:
+                        type: boolean
+                        description: Whether TLS verification is skipped for this device webhook
+                        example: false
+        '404':
+          description: Device not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+    patch:
+      operationId: updateDeviceWebhook
+      tags:
+        - device
+      summary: Set device webhook configuration
+      description: |
+        Set a custom webhook configuration for a specific device. When set, webhook events for this device
+        will be sent to this URL instead of the global webhook URL. Device-level `webhook_secret`,
+        `webhook_events`, and `webhook_insecure_skip_verify` override the global webhook settings for this device.
+
+        Set to empty string to clear and use the global webhook.
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Device ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                webhook_url:
+                  type: string
+                  description: Custom webhook URL to use for this device. Set to empty string to clear.
+                  example: 'https://example.com/webhook'
+                webhook_secret:
+                  type: string
+                  description: Optional secret used to sign payloads for this device webhook.
+                  example: 'super-secret-key'
+                webhook_events:
+                  type: string
+                  description: Optional comma-separated event whitelist for this device webhook. Empty means all events.
+                  example: 'message,message.ack'
+                webhook_insecure_skip_verify:
+                  type: boolean
+                  description: Optional. Skip TLS certificate verification for this device webhook.
+                  example: false
+              required:
+                - webhook_url
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: integer
+                    example: 200
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                    example: Device webhook updated
+                  results:
+                    type: object
+                    properties:
+                      device_id:
+                        type: string
+                        description: The device ID
+                        example: 'my-device'
+                      webhook_url:
+                        type: string
+                        description: The configured webhook URL
+                        example: 'https://example.com/webhook'
+                      webhook_secret:
+                        type: string
+                        description: Secret used to sign payloads for this device webhook
+                        example: 'super-secret-key'
+                      webhook_events:
+                        type: string
+                        description: Comma-separated event whitelist for this device webhook
+                        example: 'message,message.ack'
+                      webhook_insecure_skip_verify:
+                        type: boolean
+                        description: Whether TLS verification is skipped for this device webhook
+                        example: false
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
         '404':
           description: Device not found
           content:
@@ -681,12 +1073,12 @@ paths:
       summary: User My List Groups
       description: |
         Get all groups that the authenticated user has joined.
-        
+
         ⚠️ **Known Limitation**: This endpoint returns a maximum of 500 groups due to a WhatsApp protocol limitation.
         The underlying whatsmeow library's `GetJoinedGroups()` function sends a single query to WhatsApp servers,
         which enforces this limit. This is not a bug in this API - it's a constraint imposed by WhatsApp's
         multi-device protocol. Users with more than 500 groups will only receive the first 500 groups.
-        
+
         For more details, see: https://github.com/tulir/whatsmeow/blob/main/group.go
       externalDocs:
         description: WhatsApp protocol limitation reference (whatsmeow source)
@@ -817,7 +1209,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
-  
+
   /send/message:
     post:
       operationId: sendMessage
@@ -831,6 +1223,8 @@ paths:
           application/json:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -850,8 +1244,8 @@ paths:
                   description: Whether this is a forwarded message
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
                 mentions:
                   type: array
                   items:
@@ -892,6 +1286,8 @@ paths:
           multipart/form-data:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -901,6 +1297,19 @@ paths:
                   type: string
                   example: selamat malam
                   description: Caption to send
+                mentions:
+                  type: array
+                  items:
+                    type: string
+                  example: ["628123456789", "@everyone"]
+                  description: |
+                    List of phone numbers to mention (ghost mentions - no @ required in caption).
+                    `@phone` in the caption is also mentioned. Use special keyword "@everyone" to mention all group participants.
+                    Send one `mentions` form field per entry.
+                reply_message_id:
+                  type: string
+                  example: 3EB089B9D6ADD58153C561
+                  description: Message ID that you want reply
                 view_once:
                   type: boolean
                   example: false
@@ -917,10 +1326,14 @@ paths:
                   type: boolean
                   example: false
                   description: Compress image
+                hd:
+                  type: boolean
+                  example: true
+                  description: Send a high-definition image rendition (maximum edge 2560px). Overrides compress when true.
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
                 is_forwarded:
                   type: boolean
                   example: false
@@ -957,6 +1370,8 @@ paths:
           multipart/form-data:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -970,14 +1385,22 @@ paths:
                   type: string
                   example: https://example.com/audio.mp3
                   description: Audio URL to send
+                ptt:
+                  type: boolean
+                  example: false
+                  description: Send as a WhatsApp voice note. When true, ffmpeg is required to transcode to OGG Opus.
+                reply_message_id:
+                  type: string
+                  example: 3EB089B9D6ADD58153C561
+                  description: Message ID that you want reply
                 is_forwarded:
                   type: boolean
                   example: false
                   description: Whether this is a forwarded message
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
       responses:
         '200':
           description: OK
@@ -1010,6 +1433,8 @@ paths:
           multipart/form-data:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -1019,18 +1444,35 @@ paths:
                   type: string
                   example: selamat malam
                   description: Caption to send
+                mentions:
+                  type: array
+                  items:
+                    type: string
+                  example: ["628123456789", "@everyone"]
+                  description: |
+                    List of phone numbers to mention (ghost mentions - no @ required in caption).
+                    `@phone` in the caption is also mentioned. Use special keyword "@everyone" to mention all group participants.
+                    Send one `mentions` form field per entry.
+                reply_message_id:
+                  type: string
+                  example: 3EB089B9D6ADD58153C561
+                  description: Message ID that you want reply
                 file:
                   type: string
                   format: binary
                   description: File to send
+                file_url:
+                  type: string
+                  example: https://example.com/document.pdf
+                  description: File URL to download and send
                 is_forwarded:
                   type: boolean
                   example: false
                   description: Whether this is a forwarded message
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
       responses:
         '200':
           description: OK
@@ -1064,6 +1506,8 @@ paths:
           multipart/form-data:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -1079,8 +1523,8 @@ paths:
                   description: URL of sticker image to send
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
                 is_forwarded:
                   type: boolean
                   example: false
@@ -1117,6 +1561,8 @@ paths:
           multipart/form-data:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -1126,6 +1572,19 @@ paths:
                   type: string
                   example: ini contoh caption video
                   description: Caption to send
+                mentions:
+                  type: array
+                  items:
+                    type: string
+                  example: ["628123456789", "@everyone"]
+                  description: |
+                    List of phone numbers to mention (ghost mentions - no @ required in caption).
+                    `@phone` in the caption is also mentioned. Use special keyword "@everyone" to mention all group participants.
+                    Send one `mentions` form field per entry.
+                reply_message_id:
+                  type: string
+                  example: 3EB089B9D6ADD58153C561
+                  description: Message ID that you want reply
                 view_once:
                   type: boolean
                   example: false
@@ -1142,14 +1601,18 @@ paths:
                   type: boolean
                   example: false
                   description: Compress video
+                hd:
+                  type: boolean
+                  example: true
+                  description: Send an H.264 8-bit YUV 4:2:0 high-definition video rendition at CRF 23, capped at 1280x1280 while preserving aspect ratio and avoiding upscaling. Overrides compress when true.
                 gif_playback:
                   type: boolean
                   example: false
                   description: Display video as GIF (looping, silent, autoplay)
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
                 is_forwarded:
                   type: boolean
                   example: false
@@ -1186,6 +1649,8 @@ paths:
           application/json:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -1205,8 +1670,8 @@ paths:
                   description: Whether this is a forwarded message
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
       responses:
         '200':
           description: OK
@@ -1239,6 +1704,8 @@ paths:
           application/json:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -1258,8 +1725,8 @@ paths:
                   description: Whether this is a forwarded message
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
       responses:
         '200':
           description: OK
@@ -1292,6 +1759,8 @@ paths:
           application/json:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -1311,8 +1780,8 @@ paths:
                   description: Whether this is a forwarded message
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
       responses:
         '200':
           description: OK
@@ -1346,6 +1815,8 @@ paths:
           application/json:
             schema:
               type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
               properties:
                 phone:
                   type: string
@@ -1367,8 +1838,8 @@ paths:
                   example: 2
                 duration:
                   type: integer
-                  example: 3600
-                  description: Disappearing message duration in seconds (optional)
+                  example: 86400
+                  description: "Disappearing message duration in seconds. Allowed values: 0 (no expiry), 86400 (24h), 604800 (7d), 7776000 (90d)."
               required:
                 - phone
                 - question
@@ -1444,7 +1915,7 @@ paths:
       tags:
         - send
       summary: Send chat presence (typing indicator)
-      description: Send typing indicator to start or stop showing that you are composing a message
+      description: Send typing indicator to start or stop showing that you are composing a message. Presence cannot be scheduled; schedule fields (scheduled_at, timezone, recurrence, ...) are rejected with 400.
       parameters:
         - $ref: '#/components/parameters/DeviceIdHeader'
       requestBody:
@@ -1479,6 +1950,207 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /send/schedules:
+    get:
+      operationId: listScheduledSends
+      tags:
+        - send
+      summary: List scheduled sends
+      description: >-
+        Lists the device's scheduled sends. Upcoming schedules come first
+        (soonest next run first), followed by finished ones, newest first.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, running, paused, completed, failed, cancelled]
+          description: Only schedules in this status
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Match the recipient or the message text
+        - name: message_type
+          in: query
+          schema:
+            type: string
+            enum: [text, image, file, video, audio, sticker, contact, link, location, poll, forward]
+          description: Only this kind of scheduled send
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 25
+            minimum: 1
+            maximum: 100
+          description: Maximum number of schedules to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+          description: Number of schedules to skip (for pagination)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleListResponse'
+        '400':
+          description: Bad Request (e.g. unknown status or message_type, limit or offset out of range)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /send/schedules/{schedule_id}:
+    get:
+      operationId: getScheduledSend
+      tags:
+        - send
+      summary: Get a scheduled send
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/ScheduleIdPath'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleResponse'
+        '404':
+          description: Schedule not found for this device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /send/schedules/{schedule_id}/pause:
+    post:
+      operationId: pauseScheduledSend
+      tags:
+        - send
+      summary: Pause a scheduled send
+      description: Stops an active schedule from sending until it is resumed. Only an active schedule can be paused.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/ScheduleIdPath'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericResponse'
+        '400':
+          description: Bad Request (the schedule is not active)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '404':
+          description: Schedule not found for this device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /send/schedules/{schedule_id}/resume:
+    post:
+      operationId: resumeScheduledSend
+      tags:
+        - send
+      summary: Resume a paused scheduled send
+      description: >-
+        Makes a paused schedule active again. Only a paused schedule can be
+        resumed. A recurring schedule whose next run passed while paused
+        continues at its next slot, or completes if none is left; an overdue
+        one-time schedule sends right away.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/ScheduleIdPath'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericResponse'
+        '400':
+          description: Bad Request (the schedule is not paused)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '404':
+          description: Schedule not found for this device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /send/schedules/{schedule_id}/cancel:
+    post:
+      operationId: cancelScheduledSend
+      tags:
+        - send
+      summary: Cancel a scheduled send
+      description: >-
+        Cancels an active, paused, or failed schedule so it never sends again.
+        Its stored media is removed.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/ScheduleIdPath'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericResponse'
+        '400':
+          description: Bad Request (the schedule is running, completed, or already cancelled)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '404':
+          description: Schedule not found for this device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
         '500':
           description: Internal Server Error
           content:
@@ -1719,6 +2391,56 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
+  /message/{message_id}/played:
+    post:
+      operationId: markMessagePlayed
+      tags:
+        - message
+      summary: Mark an audio message as played
+      description: >-
+        Sends WhatsApp's played receipt for an incoming audio message or voice
+        note. The message must exist in the active device's chat storage and
+        belong to the supplied chat.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - in: path
+          name: message_id
+          schema:
+            type: string
+          required: true
+          description: Message ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                phone:
+                  type: string
+                  example: '62819273192397132@s.whatsapp.net'
+                  description: Phone number or group JID containing the audio message
+              required:
+                - phone
+      responses:
+        '200':
+          description: Played receipt sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendResponse'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
   /message/{message_id}/star:
     post:
       operationId: starMessage
@@ -1809,6 +2531,66 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
+  /message/{message_id}/forward:
+    post:
+      operationId: forwardMessage
+      tags:
+        - message
+      summary: Forward Message
+      description: |
+        Forward a message that exists in local chat storage to another chat by message ID.
+        Text and standard media types (image, video, video note, audio, document, sticker) are supported.
+        Media references are reused when possible; stale refs trigger an automatic re-upload fallback.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - in: path
+          name: message_id
+          schema:
+            type: string
+          required: true
+          description: Source message ID from chat storage
+          example: '3EB0123456789ABCDEF'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              allOf:
+                - $ref: '#/components/schemas/ScheduleOptions'
+              required:
+                - phone
+              properties:
+                phone:
+                  type: string
+                  example: '6289685024051@s.whatsapp.net'
+                  description: Destination phone number or group JID
+                duration:
+                  type: integer
+                  example: 0
+                  description: Optional disappearing message duration override (0, 86400, 604800, 7776000)
+                force_reupload:
+                  type: boolean
+                  example: false
+                  description: Skip media reference reuse and re-upload media before sending
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendResponse'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
   /message/{message_id}/download:
     get:
       operationId: downloadMessageMedia
@@ -1855,19 +2637,26 @@ paths:
                       status:
                         type: string
                         example: Media downloaded successfully
-                      mime_type:
+                      message_id:
                         type: string
-                        example: image/jpeg
+                        example: 3EB0ABC123456789
+                      media_type:
+                        type: string
+                        example: audio
+                      filename:
+                        type: string
+                        example: audio.ogg
+                      file_path:
+                        type: string
+                        description: Local server file path where the media was saved
+                        example: statics/media/6289685028129/2026-06-09/audio.ogg
+                      file_url:
+                        type: string
+                        description: Public URL for downloading the saved media when it is stored under the served statics directory
+                        example: http://localhost:3000/statics/media/6289685028129/2026-06-09/audio.ogg
                       file_size:
                         type: integer
                         example: 524288
-                      file_name:
-                        type: string
-                        example: image.jpg
-                      data:
-                        type: string
-                        format: byte
-                        description: Base64 encoded media data
         '400':
           description: Bad Request
           content:
@@ -1997,6 +2786,64 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
 
+  /call/reject:
+    post:
+      operationId: rejectCall
+      tags:
+        - call
+      summary: Reject an incoming call
+      description: |
+        Programmatically reject a specific incoming call. This endpoint allows selective call rejection
+        based on your application logic (e.g., time-of-day rules, caller whitelists, agent availability).
+
+        The call must still be ringing — rejection will fail if the call has already ended or been answered.
+
+        This is complementary to the auto-reject feature (`WHATSAPP_AUTO_REJECT_CALL=true`) which rejects
+        all incoming calls globally. Use this API for fine-grained control.
+
+        **Required fields from webhook:**
+        - `caller_jid`: Use `payload.from` from the `call.offer` webhook event
+        - `call_id`: Use `payload.call_id` from the `call.offer` webhook event
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - caller_jid
+                - call_id
+              properties:
+                caller_jid:
+                  type: string
+                  example: '628987654321@s.whatsapp.net'
+                  description: JID of the caller (from webhook `payload.from`)
+                call_id:
+                  type: string
+                  example: 'ABC123DEF456'
+                  description: Unique call identifier (from webhook `payload.call_id`)
+      responses:
+        '200':
+          description: Call rejected successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericResponse'
+        '400':
+          description: Bad Request (missing or invalid fields)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error (call already ended, not connected, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+
   /chats:
     get:
       operationId: listChats
@@ -2074,7 +2921,7 @@ paths:
           schema:
             type: string
           required: true
-          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group)
+          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group). Percent-encoded values (e.g., groupid%40g.us) are accepted.
           example: '6289685028129@s.whatsapp.net'
         - name: limit
           in: query
@@ -2148,13 +2995,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
-  /chat/{chat_jid}/label:
+  /chat/{chat_jid}/history:
     post:
-      operationId: labelChat
+      operationId: requestChatHistory
       tags:
         - chat
-      summary: Label or unlabel a chat
-      description: Apply or remove a label from a chat conversation
+      summary: Request older chat history from the phone
+      description: >-
+        Asks the phone for older messages of a chat on demand (what WhatsApp
+        Web does when you scroll up / "load older messages"). The request is
+        anchored at the oldest message currently stored locally for that
+        chat, so the chat must already have at least one stored message. The
+        phone answers asynchronously with a history sync event that gets
+        persisted into chat storage; this endpoint only confirms the request
+        was sent, it does not return the older messages directly.
       parameters:
         - $ref: '#/components/parameters/DeviceIdHeader'
         - in: path
@@ -2162,7 +3016,7 @@ paths:
           schema:
             type: string
           required: true
-          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group)
+          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group). Percent-encoded values (e.g., groupid%40g.us) are accepted.
           example: '6289685028129@s.whatsapp.net'
       requestBody:
         content:
@@ -2170,31 +3024,22 @@ paths:
             schema:
               type: object
               properties:
-                label_id:
-                  type: string
-                  example: 'label_123'
-                  description: Unique identifier for the label
-                label_name:
-                  type: string
-                  example: 'Important'
-                  description: Display name for the label
-                labeled:
-                  type: boolean
-                  example: true
-                  description: Whether to apply (true) or remove (false) the label
-              required:
-                - label_id
-                - label_name
-                - labeled
+                count:
+                  type: integer
+                  default: 50
+                  minimum: 0
+                  maximum: 500
+                  example: 50
+                  description: Number of older messages to request from the phone. Omit it, or send 0, to use the default of 50.
       responses:
         '200':
           description: OK
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/LabelChatResponse'
+                $ref: '#/components/schemas/RequestChatHistoryResponse'
         '400':
-          description: Bad Request
+          description: Bad Request (e.g. missing chat_jid, count out of range, or chat has no stored messages to anchor on)
           content:
             application/json:
               schema:
@@ -2205,12 +3050,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorUnauthorized'
-        '404':
-          description: Chat Not Found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorNotFound'
         '500':
           description: Internal Server Error
           content:
@@ -2231,7 +3070,7 @@ paths:
           schema:
             type: string
           required: true
-          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group)
+          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group). Percent-encoded values (e.g., groupid%40g.us) are accepted.
           example: '6289685028129@s.whatsapp.net'
       requestBody:
         content:
@@ -2276,7 +3115,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
-  
+
   /chat/{chat_jid}/disappearing:
     post:
       operationId: setDisappearingTimer
@@ -2291,7 +3130,7 @@ paths:
           schema:
             type: string
           required: true
-          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group)
+          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group). Percent-encoded values (e.g., groupid%40g.us) are accepted.
           example: '6289685028129@s.whatsapp.net'
       requestBody:
         content:
@@ -2324,7 +3163,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
-  
+
   /chat/{chat_jid}/archive:
     post:
       operationId: archiveChat
@@ -2339,7 +3178,7 @@ paths:
           schema:
             type: string
           required: true
-          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group)
+          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group). Percent-encoded values (e.g., groupid%40g.us) are accepted.
           example: '6289685028129@s.whatsapp.net'
       requestBody:
         content:
@@ -2384,7 +3223,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
-  
+
   /group/info:
     get:
       operationId: groupInfo
@@ -3193,6 +4032,107 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
+  /newsletter/messages:
+    get:
+      operationId: getNewsletterMessages
+      tags:
+        - newsletter
+      summary: Get latest newsletter (channel) messages
+      description: |
+        Fetches the latest messages posted in a newsletter (channel) directly
+        from WhatsApp servers. You must be following/subscribed to the
+        newsletter to fetch its messages.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - name: newsletter_id
+          in: query
+          required: true
+          schema:
+            type: string
+          example: '120363024512399999@newsletter'
+        - name: count
+          in: query
+          required: false
+          description: Number of messages to return (default 50, max 100)
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+        - name: before
+          in: query
+          required: false
+          description: Fetch messages older than this message server ID, used for pagination
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewsletterMessagesResponse'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+
+  /newsletter/messages/{server_id}/download:
+    get:
+      operationId: downloadNewsletterMessageMedia
+      tags:
+        - newsletter
+      summary: Download media from a newsletter message
+      description: |
+        Fetches one newsletter message directly from WhatsApp by server ID,
+        downloads its media to the server's statics directory, and returns the
+        saved file metadata and public URL. Supported media types are images,
+        videos, video notes, audio, documents, and stickers.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - name: server_id
+          in: path
+          required: true
+          description: Newsletter message server ID returned by GET /newsletter/messages
+          schema:
+            type: integer
+            minimum: 1
+          example: 8872
+        - name: newsletter_id
+          in: query
+          required: true
+          description: Newsletter JID containing the message
+          schema:
+            type: string
+          example: '120363024512399999@newsletter'
+      responses:
+        '200':
+          description: Media downloaded successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewsletterMediaDownloadResponse'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Message lookup or media download failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
 
   /chatwoot/sync:
     post:
@@ -3312,6 +4252,205 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBadRequest'
 
+  /chatwoot/webhook/{device_id}:
+    post:
+      operationId: chatwootDeviceWebhook
+      tags:
+        - chatwoot
+      summary: Per-device Chatwoot webhook endpoint
+      description: |
+        Per-device variant of the Chatwoot webhook: configure each device's Chatwoot
+        inbox to POST here (the URL is returned as `webhook_url` by the device config
+        endpoints) so agent replies route deterministically to that device.
+        Route-by-config: in addition to the optional shared secret, the payload's
+        account and inbox must match the device's stored config or the request is
+        rejected with 401. Unknown device ids and non-message events are acknowledged
+        with 200 and ignored.
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          description: Device ID (or WhatsApp JID) the webhook is bound to
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Chatwoot webhook payload (see Chatwoot documentation)
+      responses:
+        '200':
+          description: Webhook processed (or acknowledged and ignored)
+        '401':
+          description: Invalid secret, or payload account/inbox does not match the device's config
+
+  /chatwoot/configs:
+    get:
+      operationId: chatwootListConfigs
+      tags:
+        - chatwoot
+      summary: List per-device Chatwoot configs
+      description: Returns every per-device Chatwoot routing config. API tokens are masked.
+      responses:
+        '200':
+          description: Configs retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                    example: Chatwoot device configs
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ChatwootDeviceConfig'
+
+  /devices/{device_id}/chatwoot/config:
+    get:
+      operationId: chatwootGetDeviceConfig
+      tags:
+        - chatwoot
+      summary: Get a device's Chatwoot config
+      description: Returns the per-device Chatwoot routing config (API token masked).
+      parameters:
+        - $ref: '#/components/parameters/ChatwootConfigDeviceId'
+      responses:
+        '200':
+          description: Config retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                    example: Chatwoot device config
+                  results:
+                    $ref: '#/components/schemas/ChatwootDeviceConfig'
+        '404':
+          description: Device not found (DEVICE_NOT_FOUND) or no config for this device (CONFIG_NOT_FOUND)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+    put:
+      operationId: chatwootUpsertDeviceConfig
+      tags:
+        - chatwoot
+      summary: Create or update a device's Chatwoot config
+      description: |
+        Routes this device's messages to its own Chatwoot destination (URL + account +
+        inbox + token) instead of the global CHATWOOT_* env config.
+        The URL is canonicalized and validated (http/https only, no embedded
+        credentials, hosts resolving to private/loopback/link-local/metadata addresses
+        are rejected unless allowlisted via CHATWOOT_ALLOWED_HOSTS).
+        On update, an empty `api_token` — or the masked value echoed back from a GET —
+        keeps the stored token. Changing the routing identity (url/account/inbox) is
+        rejected with 409 once the config has linked conversations; delete and
+        recreate the config to rebind.
+      parameters:
+        - $ref: '#/components/parameters/ChatwootConfigDeviceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - chatwoot_url
+                - account_id
+                - inbox_id
+              properties:
+                chatwoot_url:
+                  type: string
+                  example: 'https://chatwoot.example.com'
+                account_id:
+                  type: integer
+                  example: 1
+                inbox_id:
+                  type: integer
+                  example: 5
+                api_token:
+                  type: string
+                  description: Chatwoot agent/bot API token. Required on create; empty (or the masked value) keeps the stored token on update.
+                enabled:
+                  type: boolean
+                  default: true
+      responses:
+        '200':
+          description: Config saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                    example: Chatwoot device config saved
+                  results:
+                    $ref: '#/components/schemas/ChatwootDeviceConfig'
+        '400':
+          description: Invalid request (INVALID_REQUEST) or rejected URL (INVALID_CHATWOOT_URL)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '404':
+          description: Device not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '409':
+          description: Routing identity change rejected while linked conversations exist (CONFIG_HAS_LINKED_CONVERSATIONS)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+    delete:
+      operationId: chatwootDeleteDeviceConfig
+      tags:
+        - chatwoot
+      summary: Delete a device's Chatwoot config
+      description: |
+        Removes the device's Chatwoot routing config along with its stored message
+        links (stale links would otherwise keep answering reverse lookups for the old
+        destination after a rebind).
+      parameters:
+        - $ref: '#/components/parameters/ChatwootConfigDeviceId'
+      responses:
+        '200':
+          description: Config deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                    example: Chatwoot device config deleted
+                  results:
+                    type: object
+                    properties:
+                      device_id:
+                        type: string
+                        example: 'my-device-id'
+
 components:
   parameters:
     DeviceIdHeader:
@@ -3325,12 +4464,64 @@ components:
       schema:
         type: string
         example: 'my-device-id'
+    ScheduleIdPath:
+      name: schedule_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Schedule ID returned as `schedule_id` by a scheduled send
+    ChatwootConfigDeviceId:
+      name: device_id
+      in: path
+      required: true
+      description: Device ID (or WhatsApp JID) whose Chatwoot config is addressed
+      schema:
+        type: string
+        example: 'my-device-id'
 
   securitySchemes:
     basicAuth:
       type: http
       scheme: basic
   schemas:
+    ChatwootDeviceConfig:
+      type: object
+      description: Per-device Chatwoot routing config (API token masked on every read)
+      properties:
+        device_id:
+          type: string
+          example: 'my-device-id'
+        device_jid:
+          type: string
+          description: WhatsApp JID of the device; stamped automatically at login (empty before pairing)
+          example: '628123456789@s.whatsapp.net'
+        chatwoot_url:
+          type: string
+          example: 'https://chatwoot.example.com'
+        account_id:
+          type: integer
+          example: 1
+        inbox_id:
+          type: integer
+          example: 5
+        api_token:
+          type: string
+          description: Masked; only the last 4 characters are revealed
+          example: '****1234'
+        enabled:
+          type: boolean
+          example: true
+        webhook_url:
+          type: string
+          description: URL to set on this device's Chatwoot inbox so agent replies route back to this device
+          example: 'https://gowa.example.com/chatwoot/webhook/my-device-id'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
     CreateGroupResponse:
       type: object
       properties:
@@ -3731,9 +4922,195 @@ components:
             message_id:
               type: string
               example: '3EB0B430B6F8F1D0E053AC120E0A9E5C'
+              description: Omitted for scheduled sends
             status:
               type: string
               example: '<feature> success ....'
+            schedule_id:
+              type: string
+              example: '0b5c3a8e-7f5d-4d6f-9d1e-2f8c1a7b9e10'
+              description: Scheduled sends only. Use it with the /send/schedules routes.
+            scheduled_at:
+              type: string
+              format: date-time
+              example: '2026-10-01T02:00:00Z'
+              description: Scheduled sends only. The first send time.
+            next_run_at:
+              type: string
+              format: date-time
+              example: '2026-10-01T02:00:00Z'
+              description: Scheduled sends only. When the worker sends next.
+    ScheduleOptions:
+      type: object
+      description: |
+        Optional fields that schedule the message instead of sending it now. Set
+        `scheduled_at` to schedule; without it the message is sent immediately.
+        A background worker sends it at the scheduled time, retrying while the
+        device is offline or not logged in. Uploaded media is stored on the
+        server until the schedule finishes.
+        In multipart/form-data bodies, send `weekdays` as a repeated field
+        (`weekdays=1`, `weekdays=3`).
+      properties:
+        scheduled_at:
+          type: string
+          format: date-time
+          example: '2026-10-01T09:00:00+07:00'
+          description: RFC3339 time of the first send. Must be in the future. The first send always happens at this time, even if it falls outside `weekdays` or `day_of_month`; those set the repeats that follow.
+        timezone:
+          type: string
+          example: Asia/Jakarta
+          description: IANA timezone used to compute recurring runs. Required when scheduled_at is set.
+        recurrence:
+          type: string
+          enum: [once, daily, weekly, monthly]
+          default: once
+          description: How often to repeat the send
+        weekdays:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 6
+          uniqueItems: true
+          example: [1, 3, 5]
+          description: Days to send on, 0=Sunday through 6=Saturday. Required when recurrence is weekly.
+        day_of_month:
+          type: integer
+          minimum: 1
+          maximum: 31
+          example: 15
+          description: Day of the month to send on, clamped to the month's last day. Required when recurrence is monthly.
+        end_at:
+          type: string
+          format: date-time
+          example: '2026-12-31T23:59:59+07:00'
+          description: Recurring only. No sends happen after this time; must be after scheduled_at.
+        occurrence_limit:
+          type: integer
+          minimum: 1
+          example: 10
+          description: Recurring only. Stop after this many sends.
+    Schedule:
+      type: object
+      properties:
+        id:
+          type: string
+          example: '0b5c3a8e-7f5d-4d6f-9d1e-2f8c1a7b9e10'
+        message_type:
+          type: string
+          enum: [text, image, file, video, audio, sticker, contact, link, location, poll, forward]
+          example: text
+        phone:
+          type: string
+          example: '6289685028129@s.whatsapp.net'
+        summary:
+          type: string
+          example: selamat pagi
+          description: Short preview of the message
+        status:
+          type: string
+          enum: [active, running, paused, completed, failed, cancelled]
+          example: active
+          description: |
+            - `active`: waiting for its next run
+            - `running`: claimed by the worker and sending
+            - `paused`: held until resumed
+            - `completed`: no runs left
+            - `failed`: gave up after retries or a validation error
+            - `cancelled`: cancelled by the user
+        scheduled_at:
+          type: string
+          format: date-time
+          example: '2026-10-01T02:00:00Z'
+        next_run_at:
+          type: string
+          format: date-time
+          example: '2026-10-01T02:00:00Z'
+          description: Omitted when no run is left
+        timezone:
+          type: string
+          example: Asia/Jakarta
+        recurrence:
+          type: string
+          enum: [once, daily, weekly, monthly]
+          example: once
+        weekdays:
+          type: array
+          items:
+            type: integer
+          example: [1, 3, 5]
+        day_of_month:
+          type: integer
+          example: 15
+        end_at:
+          type: string
+          format: date-time
+        occurrence_limit:
+          type: integer
+          example: 10
+        occurrence_count:
+          type: integer
+          example: 0
+          description: Number of successful sends so far
+        attempts:
+          type: integer
+          example: 0
+          description: Failed attempts for the current run
+        last_run_at:
+          type: string
+          format: date-time
+        last_message_id:
+          type: string
+          example: '3EB0B430B6F8F1D0E053AC120E0A9E5C'
+        last_error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-25T08:00:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-09-25T08:00:00Z'
+    ScheduleResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: Schedule fetched
+        results:
+          $ref: '#/components/schemas/Schedule'
+    ScheduleListResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: Schedules fetched
+        results:
+          type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Schedule'
+            pagination:
+              type: object
+              properties:
+                limit:
+                  type: integer
+                  example: 25
+                offset:
+                  type: integer
+                  example: 0
+                total:
+                  type: integer
+                  example: 3
     DeviceResponse:
       type: object
       properties:
@@ -3753,7 +5130,12 @@ components:
                 example: 'Aldino Kemal'
               device:
                 type: string
-                example: '628960561XXX.0:64@s.whatsapp.net'
+                description: Session ID registered via POST /devices (stable across restarts)
+                example: 'org_2'
+              jid:
+                type: string
+                description: WhatsApp JID of the logged-in account (empty until login)
+                example: '628960561XXX@s.whatsapp.net'
 
     # Device Management Schemas (v8)
     DeviceListResponse:
@@ -3785,7 +5167,41 @@ components:
           type: integer
           example: 200
         results:
-          $ref: '#/components/schemas/DeviceInfo'
+          type: object
+          properties:
+            id:
+              type: string
+              example: 'my-device-id'
+            display_name:
+              type: string
+              example: 'John Doe'
+            state:
+              type: string
+              enum: [disconnected, connecting, connected, logged_in]
+              example: 'disconnected'
+            jid:
+              type: string
+              example: '628123456789@s.whatsapp.net'
+            created_at:
+              type: string
+              format: date-time
+              example: '2024-01-01T00:00:00Z'
+            webhook_url:
+              type: string
+              description: Device-specific webhook URL echoed when provided on create
+              example: 'https://device-webhook.example.com/handler'
+            webhook_secret:
+              type: string
+              description: Device-specific webhook secret echoed when provided on create
+              example: 'super-secret-key'
+            webhook_events:
+              type: string
+              description: Device-specific event whitelist echoed when provided on create
+              example: 'message,message.ack'
+            webhook_insecure_skip_verify:
+              type: boolean
+              description: Device-specific TLS verification setting echoed when provided on create
+              example: false
     DeviceInfoResponse:
       type: object
       properties:
@@ -3824,6 +5240,51 @@ components:
             is_logged_in:
               type: boolean
               example: true
+    DeviceLoginResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: Login success
+        status:
+          type: integer
+          example: 200
+        results:
+          type: object
+          properties:
+            device_id:
+              type: string
+              example: 'my-device-id'
+            qr_link:
+              type: string
+              example: 'http://localhost:3000/statics/images/qrcode/scan-qr-b0b7bb43-9a22-455a-814f-5a225c743310.png'
+            qr_duration:
+              type: integer
+              example: 30
+    DeviceLoginWithCodeResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: Login with code started
+        status:
+          type: integer
+          example: 200
+        results:
+          type: object
+          properties:
+            device_id:
+              type: string
+              example: 'my-device-id'
+            pair_code:
+              type: string
+              example: ABCD-1234
     DeviceInfo:
       type: object
       properties:
@@ -3838,7 +5299,7 @@ components:
           example: 'John Doe'
         state:
           type: string
-          enum: [disconnected, connected, logged_in]
+          enum: [disconnected, connecting, connected, logged_in]
           example: 'logged_in'
         jid:
           type: string
@@ -3881,6 +5342,90 @@ components:
             qr_link:
               type: string
               example: 'http://localhost:3000/statics/images/qrcode/scan-qr-b0b7bb43-9a22-455a-814f-5a225c743310.png'
+    PasskeyStatusResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: Passkey pairing status
+        results:
+          type: object
+          properties:
+            device_id:
+              type: string
+              example: device-1
+            status:
+              type: string
+              enum: [none, awaiting_response, awaiting_confirmation]
+              example: awaiting_response
+            challenge:
+              type: object
+              nullable: true
+              description: WebAuthn assertion request options (PublicKeyCredentialRequestOptions JSON, base64url-encoded binary fields)
+              properties:
+                challenge:
+                  type: string
+                  example: dGVzdC1jaGFsbGVuZ2U
+                timeout:
+                  type: integer
+                  example: 60000
+                rpId:
+                  type: string
+                  example: whatsapp.com
+                allowCredentials:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      type:
+                        type: string
+                        example: public-key
+                      transports:
+                        type: array
+                        items:
+                          type: string
+                userVerification:
+                  type: string
+                  example: required
+            code:
+              type: string
+              description: Pairing confirmation code (set while awaiting confirmation)
+              example: ABCD-EFGH
+            skip_handoff_ux:
+              type: boolean
+              example: false
+    WebAuthnAssertion:
+      type: object
+      description: WebAuthn assertion in PublicKeyCredential.toJSON() format (binary fields base64url-encoded without padding)
+      required: [id, rawId, type, response]
+      properties:
+        id:
+          type: string
+          example: XcnXe2W9me1XZTGii6JI9A
+        rawId:
+          type: string
+          example: XcnXe2W9me1XZTGii6JI9A
+        type:
+          type: string
+          example: public-key
+        response:
+          type: object
+          required: [clientDataJSON, authenticatorData, signature]
+          properties:
+            clientDataJSON:
+              type: string
+            authenticatorData:
+              type: string
+            signature:
+              type: string
+            userHandle:
+              type: string
+              nullable: true
     GenericResponse:
       type: object
       properties:
@@ -4068,6 +5613,94 @@ components:
             role:
               type: string
               example: "subscriber"
+    NewsletterMessagesResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: "SUCCESS"
+        message:
+          type: string
+          example: "Success get newsletter messages"
+        results:
+          type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/NewsletterMessage'
+    NewsletterMessage:
+      type: object
+      properties:
+        server_id:
+          type: integer
+          example: 123
+        message_id:
+          type: string
+          example: "3EB0XXXXXXXXXXXXXXXX"
+        type:
+          type: string
+          example: "text"
+        timestamp:
+          type: string
+          example: "2026-06-30T10:00:00Z"
+        views_count:
+          type: integer
+          example: 42
+        reaction_counts:
+          type: object
+          additionalProperties:
+            type: integer
+          example: { "😀": 3, "👍": 5 }
+        text:
+          type: string
+          example: "Hello from the channel!"
+    NewsletterMediaDownloadResponse:
+      type: object
+      properties:
+        status:
+          type: integer
+          example: 200
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: Media downloaded successfully
+        results:
+          type: object
+          properties:
+            server_id:
+              type: integer
+              example: 8872
+            message_id:
+              type: string
+              example: ACBD7F85529AAD63FAF376F622351D14
+            status:
+              type: string
+              example: Media downloaded successfully to statics/media/120363024512399999/2026-08-28/image.jpg
+            media_type:
+              type: string
+              enum: [image, video, video_note, audio, document, sticker]
+              example: image
+            mime_type:
+              type: string
+              example: image/jpeg
+            filename:
+              type: string
+              example: image.jpg
+            file_path:
+              type: string
+              description: Local server path where the downloaded media was saved
+              example: statics/media/120363024512399999/2026-08-28/image.jpg
+            file_url:
+              type: string
+              description: Public URL for the saved media file
+              example: http://localhost:3000/statics/media/120363024512399999/2026-08-28/image.jpg
+            file_size:
+              type: integer
+              format: int64
+              example: 524288
     MyListContactsResponse:
       type: object
       properties:
@@ -4210,7 +5843,7 @@ components:
                   close_time:
                     type: string
                     example: '18:00'
-    
+
     ChatListResponse:
       type: object
       properties:
@@ -4321,6 +5954,16 @@ components:
           type: string
           example: '6289685028129@s.whatsapp.net'
           description: Sender JID
+        sender_display_name:
+          type: string
+          example: 'Saved Contact'
+          description: >-
+            Human-readable sender label resolved dynamically when this response is produced, not stored with the message.
+            For other senders, it prefers the saved contact full name, then the stored contact push name, business name,
+            JID user part, and raw JID. For the active account, it prefers the device display name (falling back to the
+            stored account push name), account JID user part, account JID, sender JID user part, and raw sender JID.
+            A contact rename can therefore change the label returned for historical messages. `sender_jid` remains the
+            stable sender identifier.
         content:
           type: string
           example: 'Hello, how are you?'
@@ -4339,10 +5982,19 @@ components:
           example: 'image'
           nullable: true
           description: Type of media (image, video, audio, document, etc.). Value `call` indicates a stored incoming call log.
+        reactions:
+          type: array
+          description: Emoji reactions attached to this message
+          items:
+            $ref: '#/components/schemas/ChatReaction'
         call_metadata:
           type: string
           example: '{"call_id":"ABC","auto_rejected":false}'
           description: JSON string with call details when media_type is `call`. Omitted when not applicable (matches Go json omitempty).
+        referral_metadata:
+          type: string
+          example: '{"ctwa_clid":"clid_123","source_app":"whatsapp"}'
+          description: JSON string with Meta Ads referral/attribution details when the message originated from a Click-to-WhatsApp ad. Omitted when not applicable (matches Go json omitempty).
         filename:
           type: string
           example: 'photo.jpg'
@@ -4369,34 +6021,68 @@ components:
           example: '2024-01-15T10:30:00Z'
           description: Record last update timestamp
 
-    LabelChatResponse:
+    ChatReaction:
       type: object
       properties:
+        emoji:
+          type: string
+          example: '👍'
+          description: Emoji used in the reaction
+        sender_jid:
+          type: string
+          example: '628123456789@s.whatsapp.net'
+          description: JID of the user who reacted
+        sender_display_name:
+          type: string
+          example: 'Saved Contact'
+          description: >-
+            Human-readable sender label resolved dynamically when this response is produced, not stored with the reaction.
+            For other senders, it prefers the saved contact full name, then the stored contact push name, business name,
+            JID user part, and raw JID. For the active account, it prefers the device display name (falling back to the
+            stored account push name), account JID user part, account JID, sender JID user part, and raw sender JID.
+            A contact rename can therefore change the label returned for historical reactions. `sender_jid` remains the
+            stable sender identifier.
+        is_from_me:
+          type: boolean
+          example: false
+          description: Whether the reaction was made by the current user
+        timestamp:
+          type: string
+          format: date-time
+          example: '2024-01-15T10:31:00Z'
+          description: When the reaction was received
+
+    RequestChatHistoryResponse:
+      type: object
+      properties:
+        status:
+          type: integer
+          example: 200
         code:
           type: string
           example: SUCCESS
         message:
           type: string
-          example: Chat labeled successfully with label 'Important'
+          example: History sync requested successfully
         results:
           type: object
           properties:
             status:
               type: string
-              example: success
-            message:
-              type: string
-              example: Chat labeled successfully with label 'Important'
+              example: requested
             chat_jid:
               type: string
               example: '6289685028129@s.whatsapp.net'
-            label_id:
+            requested_count:
+              type: integer
+              example: 50
+            anchor_message_id:
               type: string
-              example: 'label_123'
-            labeled:
-              type: boolean
-              example: true
-
+              example: '3EB0C767D82B0A0D1234'
+            anchor_timestamp:
+              type: string
+              format: date-time
+              example: '2026-05-16T08:00:00Z'
     PinChatResponse:
       type: object
       properties:

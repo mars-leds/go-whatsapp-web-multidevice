@@ -3,8 +3,10 @@ package usecase
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"math"
 	"mime"
 	"net/http"
@@ -26,7 +28,7 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/helpers"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
 	"github.com/disintegration/imaging"
-	fiberUtils "github.com/gofiber/fiber/v2/utils"
+	fiberUtils "github.com/gofiber/utils/v2"
 	"github.com/sirupsen/logrus"
 	"github.com/valyala/fasthttp"
 	"go.mau.fi/whatsmeow"
@@ -37,6 +39,151 @@ import (
 
 // webpCanvasSizeRegex is compiled once at package level for efficiency
 var webpCanvasSizeRegex = regexp.MustCompile(`Canvas size:\s*(\d+)\s*x\s*(\d+)`)
+
+const hdImageMaxEdge = 2560
+
+type videoMetadata struct {
+	Width   uint32
+	Height  uint32
+	Seconds uint32
+}
+
+func resizeImageForHD(src image.Image) image.Image {
+	return imaging.Fit(src, hdImageMaxEdge, hdImageMaxEdge, imaging.Lanczos)
+}
+
+func prepareImageForSend(src image.Image, compress, hd bool) (image.Image, bool) {
+	if hd {
+		return resizeImageForHD(src), true
+	}
+	if compress {
+		return imaging.Resize(src, 600, 0, imaging.Lanczos), true
+	}
+	return src, false
+}
+
+func openImageForSend(imagePath string, hd bool) (image.Image, error) {
+	return imaging.Open(imagePath, imaging.AutoOrientation(hd))
+}
+
+func saveProcessedImage(src image.Image, directory, imageName string, hd bool) (string, error) {
+	prefix := "new-"
+	var saveOptions []imaging.EncodeOption
+	if hd {
+		prefix = "hd-"
+		imageName = strings.TrimSuffix(imageName, filepath.Ext(imageName)) + ".jpg"
+		saveOptions = append(saveOptions, imaging.JPEGQuality(92))
+	}
+	processedImagePath := filepath.Join(directory, prefix+imageName)
+	return processedImagePath, imaging.Save(src, processedImagePath, saveOptions...)
+}
+
+func buildHDVideoFFmpegArgs(inputPath, outputPath string) []string {
+	return []string{
+		"-i", inputPath,
+		"-c:v", "libx264",
+		"-crf", "23",
+		"-preset", "fast",
+		"-vf", "scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+		"-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		"-b:a", "128k",
+		"-movflags", "+faststart",
+		"-y",
+		outputPath,
+	}
+}
+
+// buildStickerWebPFFmpegArgs converts a single still PNG into a static WebP sticker.
+// It must not pass -vsync: ffmpeg deprecated it in 5.1 and removed it in 9.0, and
+// frame-rate sync does nothing for a one-frame input anyway.
+func buildStickerWebPFFmpegArgs(inputPath, outputPath string) []string {
+	return []string{
+		"-y",
+		"-i", inputPath,
+		"-vcodec", "libwebp",
+		"-lossless", "0",
+		"-compression_level", "6",
+		"-q:v", "60",
+		"-preset", "default",
+		"-loop", "0",
+		"-an",
+		outputPath,
+	}
+}
+
+func buildVideoTranscodeArgs(inputPath, outputPath string, compress, hd bool) ([]string, bool) {
+	if hd {
+		return buildHDVideoFFmpegArgs(inputPath, outputPath), true
+	}
+	if !compress {
+		return nil, false
+	}
+	return []string{
+		"-i", inputPath,
+		"-c:v", "libx264",
+		"-crf", "28",
+		"-preset", "fast",
+		"-vf", "scale=720:-2",
+		"-c:a", "aac",
+		"-b:a", "128k",
+		"-movflags", "+faststart",
+		"-y",
+		outputPath,
+	}, true
+}
+
+func parseVideoMetadata(data []byte) (videoMetadata, error) {
+	var probe struct {
+		Streams []struct {
+			Width    uint32 `json:"width"`
+			Height   uint32 `json:"height"`
+			Duration string `json:"duration"`
+		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return videoMetadata{}, err
+	}
+
+	var metadata videoMetadata
+	if len(probe.Streams) > 0 {
+		metadata.Width = probe.Streams[0].Width
+		metadata.Height = probe.Streams[0].Height
+	}
+	durationText := probe.Format.Duration
+	if durationText == "" || durationText == "N/A" {
+		if len(probe.Streams) > 0 {
+			durationText = probe.Streams[0].Duration
+		}
+	}
+	if duration, err := strconv.ParseFloat(durationText, 64); err == nil && duration > 0 {
+		metadata.Seconds = uint32(duration)
+	}
+	return metadata, nil
+}
+
+func getVideoMetadata(videoPath string) videoMetadata {
+	output, err := runFFProbe(
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height,duration:format=duration",
+		"-of", "json",
+		videoPath,
+	)
+	if err != nil {
+		logrus.Warnf("Failed to get video metadata: %v", err)
+		return videoMetadata{}
+	}
+	metadata, err := parseVideoMetadata(output)
+	if err != nil {
+		logrus.Warnf("Failed to parse video metadata: %v", err)
+		return videoMetadata{}
+	}
+	return metadata
+}
 
 type serviceSend struct {
 	appService      app.IAppUsecase
@@ -50,35 +197,102 @@ func NewSendService(appService app.IAppUsecase, chatStorageRepo domainChatStorag
 	}
 }
 
-// wrapSendMessage wraps the message sending process with message ID saving
+// wrapSendMessage sends the message and stores it asynchronously on success.
+// whatsmeow handles the trusted-contact (tctoken) lifecycle internally; a 463
+// "reach-out timelock" rejection is a WhatsApp server-side restriction that the
+// client cannot retry around, so it is surfaced as-is via normalizeSendError.
 func (service serviceSend) wrapSendMessage(ctx context.Context, client *whatsmeow.Client, recipient types.JID, msg *waE2E.Message, content string) (whatsmeow.SendResponse, error) {
 	ts, err := client.SendMessage(ctx, recipient, msg)
 	if err != nil {
-		return whatsmeow.SendResponse{}, err
+		return whatsmeow.SendResponse{}, normalizeSendError(err)
 	}
 
 	// Store the sent message using chatstorage
-	senderJID := ""
-	if client.Store.ID != nil {
-		senderJID = client.Store.ID.String()
-	}
+	senderJID := whatsapp.OwnSenderJID(client)
 
-	// Store message asynchronously with timeout
-	// Use a goroutine to avoid blocking the send operation
+	// Store message asynchronously with timeout.
+	// Preserve device context (for device_id scoping) but detach from request cancellation.
+	// The budget must survive chat-storage write contention (history sync batches
+	// hold the SQLite writer for a while; busy_timeout is 30s) — with a short
+	// deadline the sent message is silently missing from the chat viewer.
 	go func() {
-		storeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		storeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 
 		if err := service.chatStorageRepo.StoreSentMessageWithContext(storeCtx, ts.ID, senderJID, recipient.String(), content, ts.Timestamp, msg); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				logrus.Warn("Timeout storing sent message")
+				logrus.Warnf("Timeout storing sent message %s to %s", ts.ID, recipient.String())
 			} else {
-				logrus.Warnf("Failed to store sent message: %v", err)
+				logrus.Warnf("Failed to store sent message %s to %s: %v", ts.ID, recipient.String(), err)
 			}
 		}
 	}()
 
 	return ts, nil
+}
+
+// normalizeStoredSender renders a stored sender in the plain user form a quote's
+// Participant requires.
+//
+// The reader cannot trust what is persisted. Rows written before senders were
+// normalised on the way in still carry AD/device identity
+// ("628123456789:32@s.whatsapp.net"), and a device-suffixed JID matches no
+// participant of a chat, so the recipient cannot attribute the quoted message.
+// Normalising here covers those rows without a migration, and mirrors
+// RevokeMessage, which parses and LID-normalises a stored sender for the same
+// reason. A value that will not parse is passed through untouched.
+func normalizeStoredSender(ctx context.Context, sender string) string {
+	// ParseJID does not report failure on a malformed value — it appends the
+	// default server, so "not-a-jid" becomes "not-a-jid@s.whatsapp.net". Only
+	// touch a value that already carries one, so anything else survives verbatim
+	// instead of being rewritten into a different unusable form.
+	if !strings.Contains(sender, "@") {
+		return sender
+	}
+	parsed, err := utils.ParseJID(sender)
+	if err != nil {
+		logrus.Warnf("Could not parse stored sender %q for reply context: %v", sender, err)
+		return sender
+	}
+	return whatsapp.NormalizeJIDFromLID(ctx, parsed, whatsapp.ClientFromContext(ctx)).ToNonAD().String()
+}
+
+func (service serviceSend) mergeReplyContext(ctx context.Context, contextInfo *waE2E.ContextInfo, replyMessageID *string) *waE2E.ContextInfo {
+	if replyMessageID == nil || *replyMessageID == "" {
+		return contextInfo
+	}
+
+	// Scope the reply lookup to the active device so a message ID from another
+	// device cannot be bound as quote context (see usecase AGENTS.md).
+	message, err := service.chatStorageRepo.GetMessageByIDAndDevice(deviceIDFromContext(ctx), *replyMessageID)
+	if err != nil {
+		logrus.Warnf("Error retrieving reply message ID %s: %v, continuing without reply context", *replyMessageID, err)
+		return contextInfo
+	}
+	if message == nil {
+		logrus.Warnf("Reply message ID %s not found in storage, continuing without reply context", *replyMessageID)
+		return contextInfo
+	}
+
+	if contextInfo == nil {
+		contextInfo = &waE2E.ContextInfo{}
+	}
+	contextInfo.StanzaID = replyMessageID
+	contextInfo.Participant = proto.String(normalizeStoredSender(ctx, message.Sender))
+	contextInfo.QuotedMessage = &waE2E.Message{
+		Conversation: proto.String(message.Content),
+	}
+	return contextInfo
+}
+
+func normalizeSendError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if whatsapp.IsReachoutTimelockError(err) {
+		return pkgError.ErrWaReachoutTimelock
+	}
+	return err
 }
 
 func (service serviceSend) SendText(ctx context.Context, request domainSend.MessageRequest) (response domainSend.GenericResponse, err error) {
@@ -118,68 +332,11 @@ func (service serviceSend) SendText(ctx context.Context, request domainSend.Mess
 		msg.ExtendedTextMessage.ContextInfo.Expiration = proto.Uint32(service.getDefaultEphemeralExpiration(request.BaseRequest.Phone))
 	}
 
-	// Get mentions from text (existing behavior - parses @phone from message text)
-	parsedMentions := service.getMentionFromText(ctx, request.Message)
-
-	// Add explicit mentions from request.Mentions (ghost mentions - no @ required in text)
-	if len(request.Mentions) > 0 {
-		explicitMentions := service.getMentionsFromList(ctx, request.Mentions, dataWaRecipient)
-		parsedMentions = append(parsedMentions, explicitMentions...)
-		// Deduplicate to avoid mentioning the same person twice
-		parsedMentions = utils.UniqueStrings(parsedMentions)
+	if mentionedJIDs := service.resolveMentions(ctx, request.Message, request.Mentions, dataWaRecipient); len(mentionedJIDs) > 0 {
+		msg.ExtendedTextMessage.ContextInfo.MentionedJID = mentionedJIDs
 	}
 
-	if len(parsedMentions) > 0 {
-		msg.ExtendedTextMessage.ContextInfo.MentionedJID = parsedMentions
-	}
-
-	// Reply message
-	if request.ReplyMessageID != nil && *request.ReplyMessageID != "" {
-		message, err := service.chatStorageRepo.GetMessageByID(*request.ReplyMessageID)
-		if err != nil {
-			logrus.Warnf("Error retrieving reply message ID %s: %v, continuing without reply context", *request.ReplyMessageID, err)
-		} else if message != nil { // Only set reply context if we found the message
-			// Ensure we use a full JID (user@server) for the Participant field
-			// Use the sender JID from storage as-is. Modern storage should already provide
-			// fully-qualified JIDs (e.g., user@s.whatsapp.net or group@g.us). Avoid mutating
-			// the JID here to prevent corrupting valid group or special JIDs.
-			participantJID := message.Sender
-
-			// Build base ContextInfo with reply details
-			ctxInfo := &waE2E.ContextInfo{
-				StanzaID:    request.ReplyMessageID,
-				Participant: proto.String(participantJID),
-				QuotedMessage: &waE2E.Message{
-					Conversation: proto.String(message.Content),
-				},
-			}
-
-			// Preserve forwarding flag if set
-			if request.BaseRequest.IsForwarded {
-				ctxInfo.IsForwarded = proto.Bool(true)
-				ctxInfo.ForwardingScore = proto.Uint32(100)
-			}
-
-			// Preserve disappearing message duration if provided
-			if request.BaseRequest.Duration != nil && *request.BaseRequest.Duration > 0 {
-				ctxInfo.Expiration = proto.Uint32(uint32(*request.BaseRequest.Duration))
-			} else {
-				ctxInfo.Expiration = proto.Uint32(service.getDefaultEphemeralExpiration(participantJID))
-			}
-
-			// Preserve mentions
-			if len(parsedMentions) > 0 {
-				ctxInfo.MentionedJID = parsedMentions
-			}
-
-			msg.ExtendedTextMessage = &waE2E.ExtendedTextMessage{
-				Text:        proto.String(request.Message),
-				ContextInfo: ctxInfo,
-			}
-		} else {
-			logrus.Warnf("Reply message ID %s not found in storage, continuing without reply context", *request.ReplyMessageID)
-		}
-	}
+	msg.ExtendedTextMessage.ContextInfo = service.mergeReplyContext(ctx, msg.ExtendedTextMessage.ContextInfo, request.ReplyMessageID)
 
 	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, request.Message)
 	if err != nil {
@@ -215,6 +372,11 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 		oriImagePath   string
 	)
 
+	// Prefix every temp file with a UUID, as the video path already does.
+	// Without it two concurrent sends of the same filename share one path on
+	// disk and the async cleanup below deletes the other request's files.
+	generateUUID := fiberUtils.UUIDv4()
+
 	if request.ImageURL != nil && *request.ImageURL != "" {
 		// Download image from URL
 		imageData, fileName, err := utils.DownloadImageFromURL(*request.ImageURL)
@@ -247,25 +409,25 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 			imageData = pngBuffer.Bytes()
 		}
 
-		oriImagePath = fmt.Sprintf("%s/%s", config.PathSendItems, fileName)
-		imageName = fileName
+		imageName = generateUUID + fileName
+		oriImagePath = fmt.Sprintf("%s/%s", config.PathSendItems, imageName)
 		err = os.WriteFile(oriImagePath, imageData, 0644)
 		if err != nil {
 			return response, pkgError.InternalServerError(fmt.Sprintf("failed to save downloaded image %v", err))
 		}
 	} else if request.Image != nil {
 		// Save image to server
-		oriImagePath = fmt.Sprintf("%s/%s", config.PathSendItems, request.Image.Filename)
+		imageName = generateUUID + request.Image.Filename
+		oriImagePath = fmt.Sprintf("%s/%s", config.PathSendItems, imageName)
 		err = fasthttp.SaveMultipartFile(request.Image, oriImagePath)
 		if err != nil {
 			return response, err
 		}
-		imageName = request.Image.Filename
 	}
 	deletedItems = append(deletedItems, oriImagePath)
 
 	/* Generate thumbnail with smalled image size */
-	srcImage, err := imaging.Open(oriImagePath)
+	srcImage, err := openImageForSend(oriImagePath, request.HD)
 	if err != nil {
 		return response, pkgError.InternalServerError(fmt.Sprintf("Failed to open image file '%s' for thumbnail generation: %v. Possible causes: file not found, unsupported format, or permission denied.", oriImagePath, err))
 	}
@@ -278,19 +440,14 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 	}
 	deletedItems = append(deletedItems, imageThumbnail)
 
-	if request.Compress {
-		// Resize image
-		openImageBuffer, err := imaging.Open(oriImagePath)
-		if err != nil {
-			return response, pkgError.InternalServerError(fmt.Sprintf("Failed to open image file '%s' for compression: %v. Possible causes: file not found, unsupported format, or permission denied.", oriImagePath, err))
+	preparedImage, processed := prepareImageForSend(srcImage, request.Compress, request.HD)
+	if processed {
+		processedImagePath, saveErr := saveProcessedImage(preparedImage, config.PathSendItems, imageName, request.HD)
+		if saveErr != nil {
+			return response, pkgError.InternalServerError(fmt.Sprintf("failed to save processed image %v", saveErr))
 		}
-		newImage := imaging.Resize(openImageBuffer, 600, 0, imaging.Lanczos)
-		newImagePath := fmt.Sprintf("%s/new-%s", config.PathSendItems, imageName)
-		if err = imaging.Save(newImage, newImagePath); err != nil {
-			return response, pkgError.InternalServerError(fmt.Sprintf("failed to save image %v", err))
-		}
-		deletedItems = append(deletedItems, newImagePath)
-		imagePath = newImagePath
+		deletedItems = append(deletedItems, processedImagePath)
+		imagePath = processedImagePath
 	} else {
 		imagePath = oriImagePath
 	}
@@ -300,6 +457,10 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 	dataWaImage, err := os.ReadFile(imagePath)
 	if err != nil {
 		return response, err
+	}
+	imageConfig, _, err := image.DecodeConfig(bytes.NewReader(dataWaImage))
+	if err != nil {
+		return response, pkgError.InternalServerError(fmt.Sprintf("failed to read sent image dimensions %v", err))
 	}
 	uploadedImage, err := service.uploadMedia(ctx, client, whatsmeow.MediaImage, dataWaImage, dataWaRecipient)
 	if err != nil {
@@ -321,6 +482,8 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 		FileEncSHA256: uploadedImage.FileEncSHA256,
 		FileSHA256:    uploadedImage.FileSHA256,
 		FileLength:    proto.Uint64(uint64(len(dataWaImage))),
+		Width:         proto.Uint32(uint32(imageConfig.Width)),
+		Height:        proto.Uint32(uint32(imageConfig.Height)),
 		ViewOnce:      proto.Bool(request.ViewOnce),
 	}}
 
@@ -338,6 +501,13 @@ func (service serviceSend) SendImage(ctx context.Context, request domainSend.Ima
 		}
 		msg.ImageMessage.ContextInfo.Expiration = proto.Uint32(uint32(*request.BaseRequest.Duration))
 	}
+	if mentionedJIDs := service.resolveMentions(ctx, request.Caption, request.Mentions, dataWaRecipient); len(mentionedJIDs) > 0 {
+		if msg.ImageMessage.ContextInfo == nil {
+			msg.ImageMessage.ContextInfo = &waE2E.ContextInfo{}
+		}
+		msg.ImageMessage.ContextInfo.MentionedJID = mentionedJIDs
+	}
+	msg.ImageMessage.ContextInfo = service.mergeReplyContext(ctx, msg.ImageMessage.ContextInfo, request.ReplyMessageID)
 
 	caption := "🖼️ Image"
 	if request.Caption != "" {
@@ -429,6 +599,13 @@ func (service serviceSend) SendFile(ctx context.Context, request domainSend.File
 		}
 		msg.DocumentMessage.ContextInfo.Expiration = proto.Uint32(uint32(*request.BaseRequest.Duration))
 	}
+	if mentionedJIDs := service.resolveMentions(ctx, request.Caption, request.Mentions, dataWaRecipient); len(mentionedJIDs) > 0 {
+		if msg.DocumentMessage.ContextInfo == nil {
+			msg.DocumentMessage.ContextInfo = &waE2E.ContextInfo{}
+		}
+		msg.DocumentMessage.ContextInfo.MentionedJID = mentionedJIDs
+	}
+	msg.DocumentMessage.ContextInfo = service.mergeReplyContext(ctx, msg.DocumentMessage.ContextInfo, request.ReplyMessageID)
 
 	caption := "📄 Document"
 	if fileName != "" {
@@ -808,37 +985,21 @@ func (service serviceSend) SendVideo(ctx context.Context, request domainSend.Vid
 	deletedItems = append(deletedItems, thumbnailResizeVideoPath)
 	videoThumbnail = thumbnailResizeVideoPath
 
-	// Compress if requested
-	if request.Compress {
-		compresVideoPath := fmt.Sprintf("%s/%s", config.PathSendItems, generateUUID+".mp4")
-
-		// Use proper compression settings to reduce file size
-		// -crf 28: Constant Rate Factor (18-28 is good range, higher = smaller file)
-		// -preset medium: Balance between encoding speed and compression efficiency
-		// -c:v libx264: Use H.264 codec for video
-		// -c:a aac: Use AAC codec for audio
-		// -movflags +faststart: Optimize for web streaming
-		// -vf scale=720:-2: Scale video to max width 720px, maintain aspect ratio
-		cmdCompress := exec.Command("ffmpeg", "-i", oriVideoPath,
-			"-c:v", "libx264",
-			"-crf", "28",
-			"-preset", "fast",
-			"-vf", "scale=720:-2",
-			"-c:a", "aac",
-			"-b:a", "128k",
-			"-movflags", "+faststart",
-			"-y", // Overwrite output file if it exists
-			compresVideoPath)
-
-		// Capture both stdout and stderr for better error reporting
-		output, err := cmdCompress.CombinedOutput()
+	transcodedVideoPath := fmt.Sprintf("%s/%s.mp4", config.PathSendItems, generateUUID)
+	transcodeArgs, shouldTranscode := buildVideoTranscodeArgs(oriVideoPath, transcodedVideoPath, request.Compress, request.HD)
+	if shouldTranscode {
+		cmdTranscode := exec.Command("ffmpeg", transcodeArgs...)
+		output, err := cmdTranscode.CombinedOutput()
 		if err != nil {
+			if request.HD {
+				logrus.Errorf("ffmpeg HD conversion failed: %v, output: %s", err, string(output))
+				return response, pkgError.InternalServerError(fmt.Sprintf("failed to convert video to HD: %v", err))
+			}
 			logrus.Errorf("ffmpeg compression failed: %v, output: %s", err, string(output))
 			return response, pkgError.InternalServerError(fmt.Sprintf("failed to compress video: %v", err))
 		}
-
-		videoPath = compresVideoPath
-		deletedItems = append(deletedItems, compresVideoPath)
+		videoPath = transcodedVideoPath
+		deletedItems = append(deletedItems, transcodedVideoPath)
 	} else {
 		videoPath = oriVideoPath
 	}
@@ -849,6 +1010,7 @@ func (service serviceSend) SendVideo(ctx context.Context, request domainSend.Vid
 	if err != nil {
 		return response, err
 	}
+	metadata := getVideoMetadata(videoPath)
 	uploaded, err := service.uploadMedia(ctx, client, whatsmeow.MediaVideo, dataWaVideo, dataWaRecipient)
 	if err != nil {
 		return response, pkgError.InternalServerError(fmt.Sprintf("Failed to upload file: %v", err))
@@ -874,6 +1036,15 @@ func (service serviceSend) SendVideo(ctx context.Context, request domainSend.Vid
 		ThumbnailSHA256:     dataWaThumbnail,
 		ThumbnailDirectPath: proto.String(uploaded.DirectPath),
 	}}
+	if metadata.Width > 0 {
+		msg.VideoMessage.Width = proto.Uint32(metadata.Width)
+	}
+	if metadata.Height > 0 {
+		msg.VideoMessage.Height = proto.Uint32(metadata.Height)
+	}
+	if metadata.Seconds > 0 {
+		msg.VideoMessage.Seconds = proto.Uint32(metadata.Seconds)
+	}
 
 	if request.BaseRequest.IsForwarded {
 		msg.VideoMessage.ContextInfo = &waE2E.ContextInfo{
@@ -888,6 +1059,13 @@ func (service serviceSend) SendVideo(ctx context.Context, request domainSend.Vid
 		}
 		msg.VideoMessage.ContextInfo.Expiration = proto.Uint32(uint32(*request.BaseRequest.Duration))
 	}
+	if mentionedJIDs := service.resolveMentions(ctx, request.Caption, request.Mentions, dataWaRecipient); len(mentionedJIDs) > 0 {
+		if msg.VideoMessage.ContextInfo == nil {
+			msg.VideoMessage.ContextInfo = &waE2E.ContextInfo{}
+		}
+		msg.VideoMessage.ContextInfo.MentionedJID = mentionedJIDs
+	}
+	msg.VideoMessage.ContextInfo = service.mergeReplyContext(ctx, msg.VideoMessage.ContextInfo, request.ReplyMessageID)
 
 	caption := "🎥 Video"
 	if request.Caption != "" {
@@ -919,10 +1097,12 @@ func (service serviceSend) SendContact(ctx context.Context, request domainSend.C
 		return response, err
 	}
 
+	contactName := strings.TrimSpace(request.ContactName)
+	contactPhone := utils.CleanPhoneForWhatsApp(request.ContactPhone)
 	msgVCard := fmt.Sprintf("BEGIN:VCARD\nVERSION:3.0\nN:;%v;;;\nFN:%v\nTEL;type=CELL;waid=%v:+%v\nEND:VCARD",
-		request.ContactName, request.ContactName, request.ContactPhone, request.ContactPhone)
+		contactName, contactName, contactPhone, contactPhone)
 	msg := &waE2E.Message{ContactMessage: &waE2E.ContactMessage{
-		DisplayName: proto.String(request.ContactName),
+		DisplayName: proto.String(contactName),
 		Vcard:       proto.String(msgVCard),
 	}}
 
@@ -940,7 +1120,10 @@ func (service serviceSend) SendContact(ctx context.Context, request domainSend.C
 		msg.ContactMessage.ContextInfo.Expiration = proto.Uint32(uint32(*request.BaseRequest.Duration))
 	}
 
-	content := "👤 " + request.ContactName
+	content := "👤 " + contactName
+	if contactPhone != "" {
+		content = fmt.Sprintf("👤 %s (+%s)", contactName, contactPhone)
+	}
 
 	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, content)
 	if err != nil {
@@ -980,13 +1163,15 @@ func (service serviceSend) SendLink(ctx context.Context, request domainSend.Link
 		logrus.Debugf("Image dimensions: Square image or dimensions not available")
 	}
 
+	messageText := buildLinkMessageText(request.Caption, request.Link)
+
 	// Create the message
 	msg := &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-		Text:          proto.String(fmt.Sprintf("%s\n%s", request.Caption, request.Link)),
+		Text:          proto.String(messageText),
 		Title:         proto.String(metadata.Title),
 		MatchedText:   proto.String(request.Link),
 		Description:   proto.String(metadata.Description),
-		JPEGThumbnail: metadata.ImageThumb,
+		JPEGThumbnail: metadata.JPEGThumb,
 	}}
 
 	if request.BaseRequest.IsForwarded {
@@ -1012,6 +1197,7 @@ func (service serviceSend) SendLink(ctx context.Context, request domainSend.Link
 			msg.ExtendedTextMessage.ThumbnailSHA256 = uploadedThumb.FileSHA256
 			msg.ExtendedTextMessage.ThumbnailEncSHA256 = uploadedThumb.FileEncSHA256
 			msg.ExtendedTextMessage.MediaKey = uploadedThumb.MediaKey
+			msg.ExtendedTextMessage.MediaKeyTimestamp = proto.Int64(time.Now().Unix())
 			if metadata.Height != nil {
 				msg.ExtendedTextMessage.ThumbnailHeight = metadata.Height
 			}
@@ -1023,11 +1209,7 @@ func (service serviceSend) SendLink(ctx context.Context, request domainSend.Link
 		}
 	}
 
-	content := "🔗 " + request.Link
-	if request.Caption != "" {
-		content = "🔗 " + request.Caption
-	}
-	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, content)
+	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, messageText)
 	if err != nil {
 		return response, err
 	}
@@ -1035,6 +1217,17 @@ func (service serviceSend) SendLink(ctx context.Context, request domainSend.Link
 	response.MessageID = ts.ID
 	response.Status = fmt.Sprintf("Link sent to %s (server timestamp: %s)", request.BaseRequest.Phone, ts.Timestamp.String())
 	return response, nil
+}
+
+func buildLinkMessageText(caption, link string) string {
+	caption = strings.TrimSpace(caption)
+	link = strings.TrimSpace(link)
+
+	if caption == "" {
+		return link
+	}
+
+	return fmt.Sprintf("%s\n%s", caption, link)
 }
 
 func (service serviceSend) SendLocation(ctx context.Context, request domainSend.LocationRequest) (response domainSend.GenericResponse, err error) {
@@ -1282,6 +1475,7 @@ func (service serviceSend) SendAudio(ctx context.Context, request domainSend.Aud
 		}
 		msg.AudioMessage.ContextInfo.Expiration = proto.Uint32(uint32(*request.BaseRequest.Duration))
 	}
+	msg.AudioMessage.ContextInfo = service.mergeReplyContext(ctx, msg.AudioMessage.ContextInfo, request.ReplyMessageID)
 
 	content := "🎵 Audio"
 
@@ -1328,8 +1522,45 @@ func (service serviceSend) SendPoll(ctx context.Context, request domainSend.Poll
 	}
 
 	response.MessageID = ts.ID
+	if err := service.persistSentPollDefinition(ctx, dataWaRecipient, ts.ID, request, ts.Timestamp); err != nil {
+		// The WhatsApp send already succeeded. Keep the API response successful
+		// while making the loss of future vote resolution visible in logs.
+		logrus.Warnf("Failed to persist sent poll definition %s: %v", ts.ID, err)
+	}
 	response.Status = fmt.Sprintf("Send poll success %s (server timestamp: %s)", request.BaseRequest.Phone, ts.Timestamp.String())
 	return response, nil
+}
+
+func (service serviceSend) persistSentPollDefinition(ctx context.Context, recipient types.JID, pollID string, request domainSend.PollRequest, sentAt ...time.Time) error {
+	if service.chatStorageRepo == nil {
+		return fmt.Errorf("chat storage repository is not configured")
+	}
+	deviceID := deviceIDFromContext(ctx)
+	if deviceID == "" {
+		return domainChatStorage.ErrMissingDeviceContext
+	}
+	options := make([]domainChatStorage.PollOption, 0, len(request.Options))
+	for _, name := range request.Options {
+		hash := whatsmeow.HashPollOptions([]string{name})
+		hashHex := ""
+		if len(hash) > 0 {
+			hashHex = fmt.Sprintf("%x", hash[0])
+		}
+		options = append(options, domainChatStorage.PollOption{Name: name, Hash: hashHex})
+	}
+	definition := &domainChatStorage.PollDefinition{
+		DeviceID:              deviceID,
+		ChatJID:               recipient.ToNonAD().String(),
+		PollMessageID:         pollID,
+		Question:              request.Question,
+		Options:               options,
+		SelectableOptionCount: uint32(request.MaxAnswer),
+		Version:               "v1",
+	}
+	if len(sentAt) > 0 {
+		definition.UpdatedAt = sentAt[0]
+	}
+	return service.chatStorageRepo.UpsertPollDefinition(definition)
 }
 
 func (service serviceSend) SendPresence(ctx context.Context, request domainSend.PresenceRequest) (response domainSend.GenericResponse, err error) {
@@ -1408,6 +1639,16 @@ func (service serviceSend) getMentionFromText(ctx context.Context, messages stri
 		if dataWaRecipient, err := utils.ValidateJidWithLogin(client, mention); err == nil {
 			result = append(result, dataWaRecipient.String())
 		}
+	}
+	return result
+}
+
+// resolveMentions combines @phone mentions parsed from text with explicit (ghost)
+// mentions, deduplicated so the same person is not mentioned twice.
+func (service serviceSend) resolveMentions(ctx context.Context, text string, mentions []string, recipientJID types.JID) []string {
+	result := service.getMentionFromText(ctx, text)
+	if len(mentions) > 0 {
+		result = utils.UniqueStrings(append(result, service.getMentionsFromList(ctx, mentions, recipientJID)...))
 	}
 	return result
 }
@@ -1690,7 +1931,7 @@ func (service serviceSend) SendSticker(ctx context.Context, request domainSend.S
 	// Check if ffmpeg is available
 	if _, err := exec.LookPath("ffmpeg"); err == nil {
 		// Use ffmpeg to convert to WebP with transparency support, overwrite if exists
-		convertCmd = exec.CommandContext(convCtx, "ffmpeg", "-y", "-i", pngPath, "-vcodec", "libwebp", "-lossless", "0", "-compression_level", "6", "-q:v", "60", "-preset", "default", "-loop", "0", "-an", "-vsync", "0", webpPath)
+		convertCmd = exec.CommandContext(convCtx, "ffmpeg", buildStickerWebPFFmpegArgs(pngPath, webpPath)...)
 	} else if _, err := exec.LookPath("cwebp"); err == nil {
 		// Use cwebp as fallback
 		convertCmd = exec.CommandContext(convCtx, "cwebp", "-q", "60", "-o", webpPath, pngPath)

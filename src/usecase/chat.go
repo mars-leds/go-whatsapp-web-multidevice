@@ -13,6 +13,7 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type serviceChat struct {
@@ -29,6 +30,8 @@ func (service serviceChat) ListChats(ctx context.Context, request domainChat.Lis
 	if err = validations.ValidateListChats(ctx, &request); err != nil {
 		return response, err
 	}
+
+	chatDisplayNameResolver := whatsapp.NewChatDisplayNameResolver(ctx, whatsapp.ClientFromContext(ctx))
 
 	// Create filter from request
 	filter := &domainChatStorage.ChatFilter{
@@ -60,7 +63,7 @@ func (service serviceChat) ListChats(ctx context.Context, request domainChat.Lis
 	for _, chat := range chats {
 		chatInfo := domainChat.ChatInfo{
 			JID:                 chat.JID,
-			Name:                chat.Name,
+			Name:                chatDisplayNameResolver.Resolve(ctx, chat.JID, chat.Name),
 			LastMessageTime:     chat.LastMessageTime.Format(time.RFC3339),
 			EphemeralExpiration: chat.EphemeralExpiration,
 			CreatedAt:           chat.CreatedAt.Format(time.RFC3339),
@@ -99,13 +102,33 @@ func (service serviceChat) GetChatMessages(ctx context.Context, request domainCh
 		return response, fmt.Errorf("device identification required")
 	}
 
+	client := whatsapp.ClientFromContext(ctx)
+	chatDisplayNameResolver := whatsapp.NewChatDisplayNameResolver(ctx, client)
+
 	chat, err := service.chatStorageRepo.GetChatByDevice(deviceID, request.ChatJID)
 	if err != nil {
 		logrus.WithError(err).WithField("chat_jid", request.ChatJID).Error("Failed to get chat info")
 		return response, err
 	}
 	if chat == nil {
-		return response, fmt.Errorf("chat with JID %s not found", request.ChatJID)
+		// The chat row has not been persisted for this device yet — e.g. a
+		// conversation that has only just started, or messages received
+		// before the chat record was upserted. Returning an error here makes
+		// the endpoint respond with HTTP 500 for what is really an empty
+		// chat, so callers that poll a not-yet-stored conversation get a
+		// hard failure instead of an empty list. Treat it as "no messages
+		// yet" and return a valid empty response instead.
+		response.Data = make([]domainChat.MessageInfo, 0)
+		response.Pagination = domainChat.PaginationResponse{
+			Limit:  request.Limit,
+			Offset: request.Offset,
+			Total:  0,
+		}
+		response.ChatInfo = domainChat.ChatInfo{
+			JID:  request.ChatJID,
+			Name: chatDisplayNameResolver.Resolve(ctx, request.ChatJID, ""),
+		}
+		return response, nil
 	}
 
 	// Create message filter from request
@@ -154,7 +177,7 @@ func (service serviceChat) GetChatMessages(ctx context.Context, request domainCh
 	}
 
 	// Get total message count for pagination
-	totalCount, err := service.chatStorageRepo.GetChatMessageCount(request.ChatJID)
+	totalCount, err := service.chatStorageRepo.GetChatMessageCountByDevice(deviceID, request.ChatJID)
 	if err != nil {
 		logrus.WithError(err).WithField("chat_jid", request.ChatJID).Error("Failed to get message count")
 		// Continue with partial data
@@ -162,22 +185,44 @@ func (service serviceChat) GetChatMessages(ctx context.Context, request domainCh
 	}
 
 	// Convert entities to domain objects
+	deviceDisplayName := ""
+	if instance, ok := whatsapp.DeviceFromContext(ctx); ok && instance != nil {
+		deviceDisplayName = instance.DisplayName()
+	}
+	senderDisplayNameCache := whatsapp.NewSenderDisplayNameCache(
+		whatsapp.NewSenderDisplayNameResolver(client, deviceDisplayName),
+	)
+
 	messageInfos := make([]domainChat.MessageInfo, 0, len(messages))
 	for _, message := range messages {
 		messageInfo := domainChat.MessageInfo{
-			ID:           message.ID,
-			ChatJID:      message.ChatJID,
-			SenderJID:    message.Sender,
-			Content:      message.Content,
-			Timestamp:    message.Timestamp.Format(time.RFC3339),
-			IsFromMe:     message.IsFromMe,
-			MediaType:    message.MediaType,
-			CallMetadata: message.CallMetadata,
-			Filename:     message.Filename,
-			URL:          message.URL,
-			FileLength:   message.FileLength,
-			CreatedAt:    message.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:    message.UpdatedAt.Format(time.RFC3339),
+			ID:                message.ID,
+			ChatJID:           message.ChatJID,
+			SenderJID:         message.Sender,
+			SenderDisplayName: senderDisplayNameCache.Resolve(ctx, message.Sender, message.IsFromMe, ""),
+			Content:           message.Content,
+			Timestamp:         message.Timestamp.Format(time.RFC3339),
+			IsFromMe:          message.IsFromMe,
+			MediaType:         message.MediaType,
+			CallMetadata:      message.CallMetadata,
+			ReferralMetadata:  message.ReferralMetadata,
+			Filename:          message.Filename,
+			URL:               message.URL,
+			FileLength:        message.FileLength,
+			CreatedAt:         message.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:         message.UpdatedAt.Format(time.RFC3339),
+		}
+		if len(message.Reactions) > 0 {
+			messageInfo.Reactions = make([]domainChat.ReactionInfo, 0, len(message.Reactions))
+			for _, reaction := range message.Reactions {
+				messageInfo.Reactions = append(messageInfo.Reactions, domainChat.ReactionInfo{
+					Emoji:             reaction.Emoji,
+					SenderJID:         reaction.ReactorJID,
+					SenderDisplayName: senderDisplayNameCache.Resolve(ctx, reaction.ReactorJID, reaction.IsFromMe, ""),
+					IsFromMe:          reaction.IsFromMe,
+					Timestamp:         reaction.Timestamp.Format(time.RFC3339),
+				})
+			}
 		}
 		messageInfos = append(messageInfos, messageInfo)
 	}
@@ -185,7 +230,7 @@ func (service serviceChat) GetChatMessages(ctx context.Context, request domainCh
 	// Create chat info for response
 	chatInfo := domainChat.ChatInfo{
 		JID:                 chat.JID,
-		Name:                chat.Name,
+		Name:                chatDisplayNameResolver.Resolve(ctx, chat.JID, chat.Name),
 		LastMessageTime:     chat.LastMessageTime.Format(time.RFC3339),
 		EphemeralExpiration: chat.EphemeralExpiration,
 		CreatedAt:           chat.CreatedAt.Format(time.RFC3339),
@@ -370,6 +415,80 @@ func (service serviceChat) ArchiveChat(ctx context.Context, request domainChat.A
 		"chat_jid": request.ChatJID,
 		"archived": request.Archived,
 	}).Info("Chat archive operation completed successfully")
+
+	return response, nil
+}
+
+// RequestChatHistory asks the phone for older messages of a chat (what
+// WhatsApp Web does when you scroll up / "load older messages"). It anchors
+// the request at the oldest message currently stored for that chat and sends
+// a HISTORY_SYNC_ON_DEMAND peer message via whatsmeow's
+// BuildHistorySyncRequest. The phone answers asynchronously with a
+// *events.HistorySync (ON_DEMAND), which the existing history-sync handler
+// persists into chat storage the same way it does for the initial bootstrap.
+func (service serviceChat) RequestChatHistory(ctx context.Context, request domainChat.RequestChatHistoryRequest) (response domainChat.RequestChatHistoryResponse, err error) {
+	if err = validations.ValidateRequestChatHistory(ctx, &request); err != nil {
+		return response, err
+	}
+
+	deviceID := deviceIDFromContext(ctx)
+	if deviceID == "" {
+		return response, fmt.Errorf("device identification required")
+	}
+
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+
+	// Resolve the anchor before touching the network: a chat with no stored
+	// messages has nothing for the phone to anchor an on-demand sync on, so
+	// fail fast on that instead of requiring a live connection first.
+	oldest, err := service.chatStorageRepo.GetOldestMessageByDevice(deviceID, request.ChatJID)
+	if err != nil {
+		logrus.WithError(err).WithField("chat_jid", request.ChatJID).Error("Failed to look up oldest stored message")
+		return response, err
+	}
+	if oldest == nil {
+		return response, pkgError.ValidationError("chat has no stored messages yet; nothing to anchor the history sync request on")
+	}
+
+	// Validate JID and ensure connection
+	targetJID, err := utils.ValidateJidWithLogin(client, request.ChatJID)
+	if err != nil {
+		return response, err
+	}
+
+	// BuildHistorySyncRequest reads only Chat, ID, IsFromMe and Timestamp.
+	anchor := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     targetJID,
+			IsFromMe: oldest.IsFromMe,
+		},
+		ID:        oldest.ID,
+		Timestamp: oldest.Timestamp,
+	}
+
+	historyRequest := client.BuildHistorySyncRequest(anchor, request.Count)
+	if _, err = client.SendPeerMessage(ctx, historyRequest); err != nil {
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"chat_jid": request.ChatJID,
+			"count":    request.Count,
+		}).Error("Failed to send on-demand history sync request")
+		return response, err
+	}
+
+	response.Status = "requested"
+	response.ChatJID = request.ChatJID
+	response.RequestedCount = request.Count
+	response.AnchorMessageID = oldest.ID
+	response.AnchorTimestamp = oldest.Timestamp.Format(time.RFC3339)
+
+	logrus.WithFields(logrus.Fields{
+		"chat_jid":          request.ChatJID,
+		"requested_count":   request.Count,
+		"anchor_message_id": oldest.ID,
+	}).Info("Requested on-demand chat history successfully")
 
 	return response, nil
 }

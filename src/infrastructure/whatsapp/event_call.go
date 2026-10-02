@@ -42,16 +42,14 @@ func handleCallOffer(ctx context.Context, evt *events.CallOffer, chatStorageRepo
 		}
 	}
 
-	// Forward call event to webhook if configured
-	if len(config.WhatsappWebhook) > 0 {
-		go func(e *events.CallOffer, c *whatsmeow.Client, rejected bool) {
-			webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := forwardCallOfferToWebhook(webhookCtx, e, deviceID, c, rejected); err != nil {
-				logrus.Errorf("Failed to forward call event to webhook: %v", err)
-			}
-		}(evt, client, autoRejected)
-	}
+	// Forward call event to webhook
+	go func(e *events.CallOffer, c *whatsmeow.Client, rejected bool) {
+		webhookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := forwardCallOfferToWebhook(webhookCtx, e, deviceID, c, rejected); err != nil {
+			logrus.Errorf("Failed to forward call event to webhook: %v", err)
+		}
+	}(evt, client, autoRejected)
 }
 
 // createCallOfferPayload creates a webhook payload for incoming call events
@@ -61,7 +59,13 @@ func createCallOfferPayload(ctx context.Context, evt *events.CallOffer, deviceID
 
 	// Add call details
 	payload["call_id"] = evt.CallID
-	payload["from"] = evt.CallCreator.ToNonAD().String()
+	senderJID := evt.CallCreator
+	if senderJID.Server == "lid" {
+		payload["from_lid"] = senderJID.ToNonAD().String()
+	}
+	normalizedSenderJID := NormalizeJIDFromLID(ctx, senderJID, client)
+	payload["from"] = normalizedSenderJID.ToNonAD().String()
+	addSenderDisplayName(ctx, client, payload, false, "")
 	payload["auto_rejected"] = autoRejected
 
 	// Add caller platform info if available

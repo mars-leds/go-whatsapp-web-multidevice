@@ -148,18 +148,17 @@ func (service serviceMessage) MediaRetry(ctx context.Context, request domainMess
 		return response, errors.New("media retry notification had no new direct path")
 	}
 
-	// Download from the refreshed DirectPath. fileLength is int in
-	// whatsmeow's signature; the stored uint64 fits safely for WhatsApp
-	// media sizes (<100MB).
+	// Download from the refreshed DirectPath. allowNoHash=false: we have
+	// the original FileSHA256, so whatsmeow verifies the plaintext hash.
 	data, err := client.DownloadMediaWithPath(
 		ctx,
 		newDirectPath,
 		stored.FileEncSHA256,
 		stored.FileSHA256,
 		stored.MediaKey,
-		int(stored.FileLength),
 		mediaType,
 		mmsType,
+		false,
 	)
 	if err != nil {
 		return response, fmt.Errorf("failed to download media via new path: %w", err)

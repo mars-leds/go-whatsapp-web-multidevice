@@ -6,21 +6,34 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/sirupsen/logrus"
 )
 
-func submitWebhook(ctx context.Context, payload map[string]any, url string) error {
+func submitWebhook(ctx context.Context, payload map[string]any, url string, webhookConfig *chatstorage.DeviceWebhookConfig) error {
+	// Determine effective config - use device-specific if set, otherwise fall back to global
+	insecureSkipVerify := config.WhatsappWebhookInsecureSkipVerify
+	webhookSecret := config.WhatsappWebhookSecret
+
+	if webhookConfig != nil {
+		if webhookConfig.WebhookInsecureSkipVerify {
+			insecureSkipVerify = true
+		}
+		if webhookConfig.WebhookSecret != "" {
+			webhookSecret = webhookConfig.WebhookSecret
+		}
+	}
+
 	// Configure HTTP client with optional TLS skip verification
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: config.WhatsappWebhookInsecureSkipVerify,
+			InsecureSkipVerify: insecureSkipVerify,
 		},
 	}
 	client := &http.Client{
@@ -33,12 +46,16 @@ func submitWebhook(ctx context.Context, payload map[string]any, url string) erro
 		return pkgError.WebhookError(fmt.Sprintf("Failed to marshal body: %v", err))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	// Pass the body to NewRequestWithContext so it sets ContentLength and GetBody.
+	// Building the request with a nil body makes Go fall back to chunked transfer
+	// encoding with no Content-Length, which some receivers (notably PHP reading
+	// php://input behind nginx/FPM) deliver to the application as an empty body.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(postBody))
 	if err != nil {
 		return pkgError.WebhookError(fmt.Sprintf("error when create http object %v", err))
 	}
 
-	secretKey := []byte(config.WhatsappWebhookSecret)
+	secretKey := []byte(webhookSecret)
 	signature, err := utils.GetMessageDigestOrSignature(postBody, secretKey)
 	if err != nil {
 		return pkgError.WebhookError(fmt.Sprintf("error when create signature %v", err))
@@ -52,8 +69,14 @@ func submitWebhook(ctx context.Context, payload map[string]any, url string) erro
 	var sleepDuration = 1 * time.Second
 
 	for attempt = 0; attempt < maxAttempts; attempt++ {
-		// Create new request body for each attempt
-		req.Body = io.NopCloser(bytes.NewBuffer(postBody))
+		// Rewind the body for each attempt. GetBody returns a fresh reader while
+		// leaving ContentLength intact, unlike assigning req.Body directly.
+		body, err := req.GetBody()
+		if err != nil {
+			return pkgError.WebhookError(fmt.Sprintf("error when rewind body %v", err))
+		}
+		req.Body = body
+
 		resp, err := client.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
@@ -65,7 +88,15 @@ func submitWebhook(ctx context.Context, payload map[string]any, url string) erro
 		}
 		logrus.Warnf("Attempt %d to submit webhook failed: %v", attempt+1, err)
 		if attempt < maxAttempts-1 {
-			time.Sleep(sleepDuration)
+			// Wait on the caller's context, not the wall clock. A plain Sleep here
+			// spends the full 1+2+4+8s of backoff even once the deadline has passed,
+			// so a single unreachable endpoint could overrun the caller's budget and
+			// starve whatever the caller still had to do.
+			select {
+			case <-ctx.Done():
+				return pkgError.WebhookError(fmt.Sprintf("error when submit webhook after %d attempts: %v", attempt+1, ctx.Err()))
+			case <-time.After(sleepDuration):
+			}
 			sleepDuration *= 2
 		}
 	}

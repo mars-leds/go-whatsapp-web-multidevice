@@ -67,8 +67,11 @@ func processHistorySync(ctx context.Context, data *waHistorySync.HistorySync, ch
 	log.Infof("Processing history sync type: %s", syncType.String())
 
 	switch syncType {
-	case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT:
-		// Process conversation messages
+	case waHistorySync.HistorySync_INITIAL_BOOTSTRAP, waHistorySync.HistorySync_RECENT, waHistorySync.HistorySync_ON_DEMAND:
+		// Process conversation messages. ON_DEMAND is the phone's reply to a
+		// history sync request built with Client.BuildHistorySyncRequest (older
+		// messages fetched on demand, e.g. "load older messages"); it carries
+		// conversations in the same shape as INITIAL_BOOTSTRAP/RECENT.
 		return processConversationMessages(ctx, data, chatStorageRepo, client)
 	case waHistorySync.HistorySync_PUSH_NAME:
 		// Process push names to update chat names
@@ -98,6 +101,10 @@ func processConversationMessages(ctx context.Context, data *waHistorySync.Histor
 		deviceID = client.Store.ID.ToNonAD().String()
 	}
 
+	// The contact store is authoritative for chat names; the conversation's own
+	// DisplayName is not. The resolver caches contacts, so build it once.
+	chatNameResolver := NewChatDisplayNameResolver(ctx, client)
+
 	for _, conv := range conversations {
 		rawChatJID := conv.GetID()
 		if rawChatJID == "" {
@@ -115,7 +122,7 @@ func processConversationMessages(ctx context.Context, data *waHistorySync.Histor
 		jid = NormalizeJIDFromLID(ctx, jid, client)
 		chatJID := jid.String()
 
-		displayName := conv.GetDisplayName()
+		displayName := conversationChatName(ctx, chatNameResolver, chatJID, jid, conv.GetDisplayName())
 
 		// Get or create chat
 		chatName := chatStorageRepo.GetChatNameWithPushName(jid, chatJID, "", displayName)
@@ -148,22 +155,15 @@ func processConversationMessages(ctx context.Context, data *waHistorySync.Histor
 				continue
 			}
 
-			// Extract message content and media info
-			content := utils.ExtractMessageTextFromProto(msg.GetMessage())
-			mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := utils.ExtractMediaInfo(msg.GetMessage())
-
-			// Skip if there's no content and no media
-			if content == "" && mediaType == "" {
-				continue
-			}
-
 			// Determine sender
 			sender := ""
+			senderJID := types.EmptyJID
 			isFromMe := msgKey.GetFromMe()
 			if isFromMe {
 				// For self-messages, use the full JID format to match regular message processing
 				if client != nil && client.Store.ID != nil {
-					sender = client.Store.ID.ToNonAD().String() // Use full JID instead of just User part
+					senderJID = client.Store.ID.ToNonAD()
+					sender = senderJID.String() // Use full JID instead of just User part
 				} else {
 					// Skip messages where we can't determine the sender to avoid NOT NULL violations
 					log.Warnf("Skipping self-message %s: client ID unavailable", messageID)
@@ -171,11 +171,19 @@ func processConversationMessages(ctx context.Context, data *waHistorySync.Histor
 				}
 			} else {
 				participant := msgKey.GetParticipant()
+				if participant == "" {
+					// History-sync group messages carry the sender in the
+					// WebMessageInfo-level `participant` (usually a @lid), NOT in
+					// key.participant (which is empty for synced group messages).
+					// Without this fallback, every inbound group message in a
+					// history sync is dropped below as "no participant info".
+					participant = msg.GetParticipant()
+				}
 				if participant != "" {
 					// For group messages, participant contains the actual sender
-					if senderJID, err := types.ParseJID(participant); err == nil {
+					if parsedSenderJID, err := types.ParseJID(participant); err == nil {
 						// Normalize sender JID (convert @lid to @s.whatsapp.net if possible)
-						senderJID = NormalizeJIDFromLID(ctx, senderJID, client)
+						senderJID = NormalizeJIDFromLID(ctx, parsedSenderJID, client)
 						sender = senderJID.ToNonAD().String() // Use full JID format for consistency
 					} else {
 						// Fallback to participant string, but ensure it's not empty
@@ -195,13 +203,63 @@ func processConversationMessages(ctx context.Context, data *waHistorySync.Histor
 						continue
 					}
 					// For individual chats, use the chat JID as sender with full format
-					sender = jid.String() // Use full JID format for consistency
+					senderJID = jid
+					sender = senderJID.String() // Use full JID format for consistency
 				}
 			}
 
 			// Convert timestamp from Unix seconds to time.Time
 			// WhatsApp history sync timestamps are in seconds, not milliseconds
 			timestamp := time.Unix(int64(msg.GetMessageTimestamp()), 0)
+
+			if msg.GetMessage().GetReactionMessage() != nil {
+				if senderJID.IsEmpty() {
+					parsed, err := types.ParseJID(sender)
+					if err != nil {
+						log.Warnf("Skipping reaction %s: failed to parse sender %q: %v", messageID, sender, err)
+						continue
+					}
+					senderJID = parsed
+				}
+
+				reactionEvt := &events.Message{
+					Info: types.MessageInfo{
+						MessageSource: types.MessageSource{
+							Chat:     jid,
+							Sender:   senderJID,
+							IsFromMe: isFromMe,
+							IsGroup:  jid.Server == types.GroupServer,
+						},
+						ID:        messageID,
+						PushName:  msg.GetPushName(),
+						Timestamp: timestamp,
+					},
+					Message: msg.GetMessage(),
+				}
+				if err := chatStorageRepo.CreateReaction(ctx, reactionEvt); err != nil {
+					log.Warnf("Failed to store history reaction %s for chat %s: %v", messageID, chatJID, err)
+				}
+				if timestamp.After(latestTimestamp) {
+					latestTimestamp = timestamp
+				}
+				continue
+			}
+
+			if poll, version := utils.ExtractPollCreationMessage(msg.GetMessage()); poll != nil {
+				definition := pollDefinitionFromCreation(deviceID, chatJID, messageID, version, poll, timestamp)
+				if err := chatStorageRepo.UpsertPollDefinition(definition); err != nil {
+					log.Warnf("Failed to store history poll definition %s for chat %s: %v", messageID, chatJID, err)
+				}
+			}
+
+			// Extract message content and media info
+			content := utils.ExtractMessageTextFromProto(msg.GetMessage())
+			mediaType, filename, mediaURL, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := utils.ExtractMediaInfo(msg.GetMessage())
+
+			// Skip if there's no content and no media
+			if content == "" && mediaType == "" {
+				continue
+			}
 
 			// Track latest timestamp
 			if timestamp.After(latestTimestamp) {
@@ -219,7 +277,8 @@ func processConversationMessages(ctx context.Context, data *waHistorySync.Histor
 				IsFromMe:      isFromMe,
 				MediaType:     mediaType,
 				Filename:      filename,
-				URL:           url,
+				URL:           mediaURL,
+				DirectPath:    directPath,
 				MediaKey:      mediaKey,
 				FileSHA256:    fileSHA256,
 				FileEncSHA256: fileEncSHA256,
@@ -239,10 +298,35 @@ func processConversationMessages(ctx context.Context, data *waHistorySync.Histor
 				EphemeralExpiration: ephemeralExpiration,
 			}
 
+			storeChat := true
+			if data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
+				// ON_DEMAND delivers messages older than the local anchor, so its
+				// batch timestamp must never move the chat's activity time backward
+				// or clobber flags (e.g. archived) that live history didn't touch.
+				// If the current state cannot be read, leave the chat row alone.
+				if existing, err := chatStorageRepo.GetChatByDevice(deviceID, chatJID); err != nil {
+					log.Warnf("Failed to load existing chat %s for on-demand merge, keeping stored metadata: %v", chatJID, err)
+					storeChat = false
+				} else if existing != nil {
+					if existing.LastMessageTime.After(chat.LastMessageTime) {
+						chat.LastMessageTime = existing.LastMessageTime
+					}
+					chat.Archived = existing.Archived
+					// An on-demand chunk carries no ephemeral setting, so a zero
+					// here means "not reported", not "disappearing messages off".
+					// Same rule the live message path uses.
+					if chat.EphemeralExpiration == 0 {
+						chat.EphemeralExpiration = existing.EphemeralExpiration
+					}
+				}
+			}
+
 			// Store or update the chat
-			if err := chatStorageRepo.StoreChat(chat); err != nil {
-				log.Warnf("Failed to store chat %s: %v", chatJID, err)
-				continue
+			if storeChat {
+				if err := chatStorageRepo.StoreChat(chat); err != nil {
+					log.Warnf("Failed to store chat %s: %v", chatJID, err)
+					continue
+				}
 			}
 
 			// Store messages in batch
@@ -326,4 +410,34 @@ func processPushNames(ctx context.Context, data *waHistorySync.HistorySync, chat
 	}
 
 	return nil
+}
+
+// conversationChatName picks the name to store for a synced conversation.
+//
+// A conversation's own DisplayName cannot be trusted for one-to-one chats: it
+// arrives empty for many of them, and for some it carries the account owner's
+// own push name, which then gets written as the name of somebody else's chat.
+// Neither is repairable later — the read path's resolver only replaces names
+// that look like a JID or a bare number, so an owner's name sticks forever, and
+// chat search filters on the stored name in SQL before any resolver runs, which
+// makes those contacts unsearchable.
+//
+// So ask the contact store first, passing no stored name so the resolver cannot
+// short-circuit on one. When it knows nobody it answers the bare user part,
+// which is no better than what we already have, so keep DisplayName then.
+func conversationChatName(ctx context.Context, resolver *ChatDisplayNameResolver, chatJID string, jid types.JID, displayName string) string {
+	if resolver == nil {
+		return displayName
+	}
+	// Only one-to-one chats are named from the contact store. Asking the resolver with
+	// no stored name makes it answer "Group <id>" / "Newsletter <id>" for those servers,
+	// which is strictly worse than the subject the conversation already carries.
+	if jid.Server == types.GroupServer || jid.Server == types.NewsletterServer {
+		return displayName
+	}
+	resolved := resolver.Resolve(ctx, chatJID, "")
+	if resolved == "" || resolved == chatJID || resolved == jid.ToNonAD().User {
+		return displayName
+	}
+	return resolved
 }

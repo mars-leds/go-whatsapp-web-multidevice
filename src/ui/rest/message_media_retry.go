@@ -9,7 +9,7 @@ import (
 	domainMessage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/message"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 // MediaRetryMessage handles POST /message/:message_id/media-retry.
@@ -18,19 +18,19 @@ import (
 // domain errors to explicit HTTP status codes (404 / 502 / 504) instead
 // of wrapping everything in a generic 500 via utils.PanicIfNeeded, so
 // callers can tell "media is gone" from "timed out waiting".
-func (controller *Message) MediaRetryMessage(c *fiber.Ctx) error {
+func (controller *Message) MediaRetryMessage(c fiber.Ctx) error {
 	var request domainMessage.MediaRetryRequest
 
 	// Accept phone + timeout_seconds from body for POST semantics, but
 	// also honor ?phone=... to stay symmetric with GET /download.
-	_ = c.BodyParser(&request)
+	_ = c.Bind().Body(&request)
 	if request.Phone == "" {
 		request.Phone = c.Query("phone")
 	}
 	request.MessageID = c.Params("message_id")
 	utils.SanitizePhone(&request.Phone)
 
-	ctx := c.UserContext()
+	ctx := c.Context()
 	if device, ok := c.Locals("device").(*whatsapp.DeviceInstance); ok {
 		ctx = whatsapp.ContextWithDevice(ctx, device)
 	}
