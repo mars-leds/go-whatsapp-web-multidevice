@@ -20,7 +20,14 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
-const defaultMediaRetryTimeout = 30 * time.Second
+const (
+	defaultMediaRetryTimeout = 30 * time.Second
+	// maxMediaRetryTimeout caps the caller-supplied timeout_seconds.
+	maxMediaRetryTimeout = 120 * time.Second
+	// mediaRetryDownloadTimeout is the budget for downloading from the
+	// refreshed DirectPath once the notification has arrived.
+	mediaRetryDownloadTimeout = 60 * time.Second
+)
 
 // MediaRetry implements domainMessage.IMessageManagement.MediaRetry.
 //
@@ -107,11 +114,17 @@ func (service serviceMessage) MediaRetry(ctx context.Context, request domainMess
 
 	timeout := defaultMediaRetryTimeout
 	if request.TimeoutSeconds > 0 {
-		timeout = time.Duration(request.TimeoutSeconds) * time.Second
+		timeout = time.Duration(min(request.TimeoutSeconds, int(maxMediaRetryTimeout/time.Second))) * time.Second
 	}
 
+	// The global RequestTimeout middleware gives every request 45s, which
+	// the wait plus the download can exceed. Detach from that deadline
+	// (context values such as the device are kept) and apply our own budget.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout+mediaRetryDownloadTimeout)
+	defer cancel()
+
 	waiter := mediaretry.Register(request.MessageID)
-	defer mediaretry.Release(request.MessageID)
+	defer waiter.Release()
 
 	if err := client.SendMediaRetryReceipt(ctx, &info, stored.MediaKey); err != nil {
 		return response, fmt.Errorf("failed to send media retry receipt: %w", err)
@@ -192,15 +205,15 @@ func (service serviceMessage) MediaRetry(ctx context.Context, request domainMess
 	response.FileSize = int64(len(data))
 
 	logrus.Info(map[string]any{
-		"message_id":     request.MessageID,
-		"phone":          request.Phone,
-		"chat":           dataWaRecipient.String(),
-		"media_type":     response.MediaType,
-		"file_path":      response.FilePath,
-		"file_size":      response.FileSize,
-		"direct_path":    newDirectPath,
-		"event":          "media_retry_success",
-		"timeout_secs":   int(timeout.Seconds()),
+		"message_id":   request.MessageID,
+		"phone":        request.Phone,
+		"chat":         dataWaRecipient.String(),
+		"media_type":   response.MediaType,
+		"file_path":    response.FilePath,
+		"file_size":    response.FileSize,
+		"direct_path":  newDirectPath,
+		"event":        "media_retry_success",
+		"timeout_secs": int(timeout.Seconds()),
 	})
 
 	return response, nil
@@ -213,7 +226,8 @@ func mapMediaType(kind string) (whatsmeow.MediaType, string, bool) {
 	switch kind {
 	case "image":
 		return whatsmeow.MediaImage, "image", true
-	case "video":
+	case "video", "video_note":
+		// video_note is a PTV (round video message); same media namespace.
 		return whatsmeow.MediaVideo, "video", true
 	case "audio":
 		return whatsmeow.MediaAudio, "audio", true
@@ -240,7 +254,7 @@ func mediaExtensionFor(kind, originalFilename string) string {
 	switch kind {
 	case "image":
 		return ".jpg"
-	case "video":
+	case "video", "video_note":
 		return ".mp4"
 	case "audio":
 		return ".ogg"

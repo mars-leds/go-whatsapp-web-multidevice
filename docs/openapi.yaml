@@ -2721,7 +2721,13 @@ paths:
                 timeout_seconds:
                   type: integer
                   default: 30
-                  description: How long to wait for the MediaRetry notification.
+                  maximum: 120
+                  description: |
+                    How long to wait for the MediaRetry notification. Values
+                    above 120 are capped. The download that follows has its
+                    own 60s budget, so the request can take up to
+                    timeout_seconds + 60s; this endpoint is exempt from the
+                    global 45s request timeout.
       responses:
         '200':
           description: OK — media retry succeeded and the file was saved.

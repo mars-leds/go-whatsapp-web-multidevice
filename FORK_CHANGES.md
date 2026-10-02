@@ -26,9 +26,10 @@ upstream gowa. This fork plugs it in.
 | `src/domains/message/media_retry.go` | new | `MediaRetryRequest` / `MediaRetryResponse` DTOs. |
 | `src/domains/message/interfaces.go` | +1 method | Adds `MediaRetry(...)` to `IMessageManagement`. |
 | `src/usecase/message_media_retry.go` | new | Service impl: send receipt, wait for event, decrypt, download via `DownloadMediaWithPath`, save to disk. |
-| `src/ui/rest/message_media_retry.go` | new | Fiber handler with 404/502/504 classification. |
+| `src/ui/rest/message_media_retry.go` | new | Fiber (v3) handler with 404/502/504 classification. |
 | `src/ui/rest/message.go` | +2 lines | Registers `POST /message/:message_id/media-retry`. |
-| `docs/openapi.yaml` | +110 lines | Documents the new endpoint. |
+| `docs/openapi.yaml` | +1 path | Documents the new endpoint. |
+| `src/infrastructure/whatsapp/mediaretry/waiter_test.go`, `src/usecase/message_media_retry_test.go` | new | Unit tests for the waiter registry and media-type mapping. |
 
 Everything else is untouched.
 
@@ -63,7 +64,11 @@ touched.
 | 400 | Missing `phone`, unsupported `media_type`, bad stored sender JID. |
 | 404 | Message not found, no media, no stored `mediaKey`, wrong chat. |
 | 502 | Sender refused the retry, decryption failed, refreshed path rejected. |
-| 504 | Timed out waiting for `events.MediaRetry` (default 30 s). |
+| 504 | Timed out waiting for `events.MediaRetry` (default 30 s, max 120 s). |
+
+The endpoint is not bound by upstream's global 45 s request timeout: it
+waits up to `timeout_seconds` for the notification, then gets a separate
+60 s budget for the download.
 
 ## Example
 
@@ -118,9 +123,17 @@ Timeout response (504):
   JID. In practice there is little reason to retry our own outbound
   media, but the code path does not explicitly block it.
 - **Concurrent retries for the same `message_id`**: the later caller
-  wins; the earlier one must rely on its own timeout.
+  wins; the earlier one stops receiving the notification and ends with
+  its own timeout (504).
 
 ## Keeping the fork in sync with upstream
+
+**Do this regularly (about monthly).** WhatsApp periodically rejects old
+whatsmeow builds with `Client outdated (405)`. When that happens, existing
+sessions can't reconnect and new QR or pairing codes can't be generated.
+Upstream bumps whatsmeow every few days, so merging upstream is the fix.
+This happened in Oct 2026: the April whatsmeow was rejected, and merging
+upstream v9.5.0 fixed it.
 
 ```bash
 # one-time

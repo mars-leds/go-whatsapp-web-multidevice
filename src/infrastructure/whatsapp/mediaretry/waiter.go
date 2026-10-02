@@ -7,7 +7,7 @@
 //  2. Handler sends the media retry receipt and blocks on the channel.
 //  3. The global whatsmeow event dispatcher calls Deliver(evt); the
 //     registered channel receives the event.
-//  4. Handler decrypts, downloads, and cleans up via Release.
+//  4. Handler decrypts, downloads, and cleans up via Waiter.Release.
 //
 // The waiter survives a single notification; duplicate events for the
 // same message_id after delivery are dropped.
@@ -44,9 +44,11 @@ func Register(messageID string) *Waiter {
 	return w
 }
 
-// Release removes the waiter. Safe to call multiple times.
-func Release(messageID string) {
-	registry.Delete(messageID)
+// Release removes the waiter if it is still the registered one, so a
+// caller that was superseded by a newer Register for the same message_id
+// cannot unregister the newer waiter. Safe to call multiple times.
+func (w *Waiter) Release() {
+	registry.CompareAndDelete(w.MessageID, w)
 }
 
 // Deliver forwards a MediaRetry event to a matching waiter, if any.
