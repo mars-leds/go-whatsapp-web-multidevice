@@ -17,6 +17,7 @@ import (
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainDevice "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/device"
 	domainGroup "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/group"
+	domainLabel "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/label"
 	domainMessage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/message"
 	domainNewsletter "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/newsletter"
 	domainSend "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/send"
@@ -52,6 +53,7 @@ var (
 	groupUsecase      domainGroup.IGroupUsecase
 	newsletterUsecase domainNewsletter.INewsletterUsecase
 	deviceUsecase     domainDevice.IDeviceUsecase
+	labelUsecase      domainLabel.ILabelUsecase // Fork-specific: labels API
 	scheduleStop      func()
 )
 
@@ -723,6 +725,7 @@ func initApp() {
 	groupUsecase = usecase.NewGroupService()
 	newsletterUsecase = usecase.NewNewsletterService()
 	deviceUsecase = usecase.NewDeviceService(dm, appUsecase)
+	labelUsecase = usecase.NewLabelService() // Fork-specific
 	scheduleCtx, scheduleCancel := context.WithCancel(context.Background())
 	scheduleService.Start(scheduleCtx)
 	// Stop gives an in-flight scheduled send up to 10s to finish before storage

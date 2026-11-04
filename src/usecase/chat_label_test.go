@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -32,4 +33,32 @@ func TestLabelChatPatchShape(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestLabelChatIndexJIDs(t *testing.T) {
+	pn := types.NewJID("5491112345678", types.DefaultUserServer)
+	lid := types.NewJID("223754944819424", "lid")
+
+	assert.Equal(t, []types.JID{pn}, labelChatIndexJIDs(pn, types.EmptyJID, true), "no LID known: phone number")
+	assert.Equal(t, []types.JID{pn}, labelChatIndexJIDs(pn, types.EmptyJID, false))
+	assert.Equal(t, []types.JID{lid}, labelChatIndexJIDs(pn, lid, true), "apply: the phone's form only")
+	assert.Equal(t, []types.JID{lid, pn}, labelChatIndexJIDs(pn, lid, false), "remove: both forms")
+}
+
+func TestBuildLabelChatPatchMultipleKeys(t *testing.T) {
+	pn := types.NewJID("5491112345678", types.DefaultUserServer)
+	lid := types.NewJID("223754944819424", "lid")
+
+	patch := buildLabelChatPatch([]types.JID{lid, pn}, "13", false)
+	assert.Equal(t, appstate.WAPatchRegular, patch.Type)
+	require.Len(t, patch.Mutations, 2)
+	assert.Equal(t, []string{"label_jid", "13", "223754944819424@lid"}, patch.Mutations[0].Index)
+	assert.Equal(t, []string{"label_jid", "13", "5491112345678@s.whatsapp.net"}, patch.Mutations[1].Index)
+	for _, m := range patch.Mutations {
+		assert.False(t, m.Value.GetLabelAssociationAction().GetLabeled())
+	}
+
+	single := buildLabelChatPatch([]types.JID{pn}, "13", true)
+	require.Len(t, single.Mutations, 1)
+	assert.True(t, single.Mutations[0].Value.GetLabelAssociationAction().GetLabeled())
 }

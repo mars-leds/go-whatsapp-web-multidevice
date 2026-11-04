@@ -20,9 +20,12 @@ type LabelChatRequest struct {
 }
 
 type LabelChatResponse struct {
-	Status    string `json:"status"`
-	Message   string `json:"message"`
-	ChatJID   string `json:"chat_jid"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	ChatJID string `json:"chat_jid"`
+	// ChatLID is the chat's LID when whatsmeow knows it; it is then the
+	// index form the association was written with (the phone's form).
+	ChatLID   string `json:"chat_lid,omitempty"`
 	LabelID   string `json:"label_id"`
 	LabelName string `json:"label_name"`
 	Labeled   bool   `json:"labeled"`

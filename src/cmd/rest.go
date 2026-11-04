@@ -142,6 +142,7 @@ func restServer(_ *cobra.Command, _ []string) {
 		rest.InitRestApp(r, appUsecase)
 		rest.InitRestCall(r, callUsecase)
 		rest.InitRestChat(r, chatUsecase)
+		rest.InitRestLabel(r, labelUsecase) // Fork-specific: GET/POST /labels, PUT/DELETE /labels/:label_id
 		rest.InitRestSend(r, sendUsecase)
 		rest.InitRestSchedule(r, scheduleUsecase)
 		rest.InitRestUser(r, userUsecase)

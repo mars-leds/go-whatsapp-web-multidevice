@@ -2,8 +2,10 @@
 
 This fork of
 [`aldinokemal/go-whatsapp-web-multidevice`](https://github.com/aldinokemal/go-whatsapp-web-multidevice)
-adds two REST endpoints: [`media-retry`](#media-retry-endpoint) and
-[`chat label`](#chat-label-endpoint). Both follow the same rules: new
+adds three features: the [`media-retry`](#media-retry-endpoint)
+endpoint, the [`chat label`](#chat-label-endpoint) endpoint and the
+[labels API](#labels-api) (`GET/POST /labels`, `PUT/DELETE
+/labels/{label_id}`, typed label webhooks). All follow the same rules: new
 files for the feature, minimal edits to upstream files marked with
 `// Fork-specific:` comments, documented in `docs/openapi.yaml`.
 
@@ -174,15 +176,27 @@ upstream had published.
 POST /chat/{chat_jid}/label  {label_id, label_name, labeled}
    |
    | 1. validate body, resolve chat_jid (LID -> PN) + require login
-   | 2. appstate.BuildLabelChat(jid, label_id, labeled)
+   | 2. take the per-client label mutex (shared with /labels)
+   | 3. resolve the chat's LID (client.Store.LIDs.GetLIDForPN)
+   | 4. appstate.BuildLabelChat(index_jid, label_id, labeled) per index key
+   |      labeled=true  -> [LID]      (the phone's form; PN if LID unknown)
+   |      labeled=false -> [LID, PN]  (one patch, two mutations)
    |      -> PatchInfo{Type: regular, Index: [label_jid, label_id, jid],
    |                   LabelAssociationAction{Labeled}}
-   | 3. client.SendAppState(ctx, patch)   (IQ w:sync:app:state, type=set)
-   | 4. phone applies it, fans it out to all devices, whatsmeow resyncs
-   |    `regular` and emits events.AppState -> webhook `label.association`
+   | 5. client.SendAppState(ctx, patch)   (IQ w:sync:app:state, type=set)
+   | 6. phone applies it, fans it out to all devices, whatsmeow resyncs
+   |    `regular` and emits events.LabelAssociationChat -> label cache +
+   |    webhook `label.association`
    v
-JSON {status, message, chat_jid, label_id, label_name, labeled}
+JSON {status, message, chat_jid, chat_lid?, label_id, label_name, labeled}
 ```
+
+Why two index forms: the phone writes `label_jid` with the chat's **LID**
+(that is why the webhook carries `chat_lid`), while the first version of
+this endpoint wrote the phone-number JID. They are different keys that
+coexist, so removing by number never cleared what the phone had put under
+the LID (and vice versa). Applying now writes the phone's form; removing
+writes both so either origin is cleared.
 
 It is the same round-trip `/chat/{chat_jid}/pin` (`BuildPin`) and
 `/chat/{chat_jid}/archive` (`BuildArchive`) already use; the only
@@ -228,24 +242,197 @@ Successful response:
 ## Known limitations / edge cases
 
 - **The label must already exist.** The endpoint only writes the
-  chat<->label association. Creating/renaming/deleting labels
-  (`appstate.BuildLabelEdit`) is deliberately not exposed, so the
-  `label_name` in the body cannot create a label; it is echoed back only.
-  Get the ids from the `label.edit` webhook events (fired on connect
-  when the `regular` app state is synced) or from the phone.
+  chat<->label association; `label_name` in the body cannot create a
+  label and is echoed back only. Create labels with `POST /labels` (see
+  [Labels API](#labels-api)) or from the phone, and get the ids from
+  `GET /labels` or the `label.edit` webhook events.
 - **Regular (non-Business) accounts** have no labels; the server may
   accept the patch and the phone will simply ignore it.
-- **No local read-back.** gowa does not persist label associations, so
-  there is no `GET`; rely on the `label.association` webhook event that
-  follows a successful patch as the confirmation.
-- **JID form.** The association is indexed by the JID the caller passes
-  (after LID -> phone-number resolution, like `/pin`). Chats that the
-  phone stores by LID may show the label under the LID key in webhook
-  events (`chat_lid`); labeling by `@lid` directly is untested.
+- **Read-back** is `GET /labels` (cached, see below); the
+  `label.association` webhook that follows a successful patch is the
+  confirmation that the phone applied it.
+- **LID unknown.** If whatsmeow has never seen the chat's LID (no message
+  exchanged since pairing) the association is written under the phone
+  number, which is what older builds always did. Whether the phone shows
+  that form for every chat is the part verified only on the dev account.
 - **App state keys.** `SendAppState` reuses the primary device's app
   state sync key (whatsmeow TODO). If the session has no synced keys yet
   (fresh pairing, before the first `regular` sync) it fails with
   `no app state keys found`; retry after the initial sync.
+
+# Labels API
+
+Adds `GET /labels`, `POST /labels`, `PUT /labels/{label_id}` and
+`DELETE /labels/{label_id}`, moves the `label.edit` / `label.association`
+webhooks to whatsmeow's typed events, fixes their `timestamp`, and makes
+`POST /chat/{chat_jid}/label` write the index form the phone uses (above).
+
+## Why
+
+A client that drives labels (apply/remove them as conversation state,
+react to a label a human puts on a chat) needs to **list** them: ids,
+names and which chats carry which label. gowa could not: whatsmeow does not
+persist label names or associations at all (its store keeps only the
+collection version, hash and mutation MACs), and upstream only forwards
+label changes as they happen, so after a restart, a missed app state
+patch or a reconnection that found the server's patch log pruned, a
+consumer has no way to resync. It also could not create labels, so every
+label had to be created by hand on the phone.
+
+## What's added (files)
+
+| File | Change | Purpose |
+| --- | --- | --- |
+| `src/infrastructure/whatsapp/labelstate/state.go` | new | Per-client in-memory cache of `label_edit` / `label_jid` records + the per-client mutex that serializes full syncs with app state writes. `NormalizeEventTime` (timestamp fix). |
+| `src/infrastructure/whatsapp/label_sync.go` | new | `FullSyncLabels`: full resync of the `regular` collection with `EmitAppStateEventsOnFullSync` raised only for the call and a temporary event handler that collects the replayed records. |
+| `src/infrastructure/whatsapp/lid_lookup.go` | new | `LIDForPN` (phone-number JID -> LID via `client.Store.LIDs`). |
+| `src/infrastructure/whatsapp/event_label.go` | rewritten | Webhook forwarder from `*events.LabelEdit` / `*events.LabelAssociationChat` (was the raw `*events.AppState`); skips `FromFullSync`; feeds the cache; same payloads as upstream. |
+| `src/infrastructure/whatsapp/event_handler.go` | +8 lines | Routes the two typed events; `handleAppState` keeps only its debug log; drops the cache on `LoggedOut`. |
+| `src/domains/label/*.go` | new | DTOs + `ILabelUsecase`. |
+| `src/validations/label_validation.go` | new | name required (<= 100 chars), color 0-19, update needs name or color. |
+| `src/usecase/label.go` | new | List (sync + normalize), create (`max id + 1`), update/delete (full-record SET). |
+| `src/usecase/chat_label.go` | rewritten | LID-aware index keys, shared mutex, optimistic cache update, `chat_lid` in the response. |
+| `src/ui/rest/label.go` | new | Fiber (v3) handlers + routes. |
+| `src/cmd/root.go`, `src/cmd/rest.go` | +3 lines | Wire the usecase and routes (device-scoped, like the rest). |
+| `src/pkg/error/label_error.go` | new | `ErrLabelNotFound` (404). |
+| `docs/openapi.yaml`, `docs/webhook-payload.md` | updated | Paths, `Label` / `ChatLabel` / `ListLabelsResponse` / `LabelMutationResponse` schemas, `chat_lid`, timestamp note. |
+| `*_test.go` next to each file | new / updated | Cache semantics, collector, flag restore, payload parity with upstream, normalization/dedup, patch shapes, validation, handlers. |
+
+## How it works
+
+### Listing (`GET /labels?refresh=`)
+
+```
+GET /labels
+   |
+   | 1. require login; take the per-client label mutex
+   | 2. if cache not synced yet, or refresh=true:
+   |      client.EmitAppStateEventsOnFullSync = true   (restored on exit)
+   |      client.AddEventHandler(collector)            (removed on exit)
+   |      client.FetchAppState(ctx, "regular", fullSync=true, false)
+   |        -> deletes the local version, downloads the snapshot,
+   |           re-emits every LabelEdit / LabelAssociationChat with
+   |           FromFullSync=true, synchronously, before returning
+   |      cache.Replace(collected)
+   | 3. labels  = every known record (deleted ones with deleted=true)
+   |    chats   = associations of non-deleted labels, LID -> PN resolved,
+   |             PN/LID forms of one chat merged (latest record wins),
+   |             chat_lid kept, sorted
+   v
+JSON {labels: [...], chats: [...], refreshed}
+```
+
+The `regular` collection carries only `label_edit`, `label_jid` and
+`label_message` (mute/pin/archive/contacts live in `regular_high`,
+`regular_low` and `critical_*`), so the resync touches nothing else. The
+main event handler ignores `FromFullSync` events, so the replay does not
+re-fire a `label.edit` / `label.association` webhook per historical
+record (upstream, which read the raw `events.AppState`, would have).
+
+Between full syncs the cache is kept current by the incremental events
+(including the resync whatsmeow runs after our own `SendAppState`), and
+each write also applies its own record optimistically. The cache is per
+`*whatsmeow.Client`, so a re-login starts empty, and it is dropped on
+`LoggedOut`.
+
+### Create / update / delete
+
+`label_edit` is a SET that replaces the whole record. `appstate.BuildLabelEdit`
+only fills name/color/deleted, so:
+
+- **create**: full record `{name, color, deleted:false, is_active:true,
+  type:CUSTOM, order_index: max+1}`, id = `max(known numeric ids) + 1`
+  (deleted labels keep their ids), after a full sync if the cache was
+  not synced yet;
+- **update**: the last known record with only name/color replaced;
+- **delete**: the last known record with `deleted: true`. Associations
+  are left alone (WhatsApp does the same); the listing filters them.
+
+### Timestamps
+
+The phone stamps `label_edit` mutations with small values that whatsmeow
+reads as milliseconds (`time.UnixMilli`), which is where the
+`"timestamp": "1970-01-01T..."` of upstream's `label.edit` webhooks came
+from. `labelstate.NormalizeEventTime` treats raw values below 1e12 as
+seconds and zero as "now"; the fix applies to the webhook `timestamp` and
+to the cache ordering.
+
+### Concurrency
+
+`SendAppState` reads the collection version without whatsmeow's sync lock;
+a full sync resets that version to 0 before refetching, so a concurrent
+write could be encoded against version 0 and rejected. Every label write
+(`/labels*`, `/chat/{jid}/label`) and every full sync take the same
+per-client mutex. Incremental syncs driven by server notifications are
+not serialized with it (they never were) and do not need to be.
+
+## HTTP status map
+
+| Code | When |
+| --- | --- |
+| 200 | OK. |
+| 400 | Malformed JSON, missing `name`, color outside 0-19, update with neither name nor color. |
+| 401 | Basic auth. |
+| 404 | `PUT`/`DELETE` on an unknown label id (after a sync if needed). |
+| 500 | Not logged in, full sync failed (offline, server error), `SendAppState` rejected (patch error, no app state keys, LTHash mismatch, label limit). |
+
+## Example
+
+```bash
+curl -u "$GOWA_USER:$GOWA_PASS" "https://gowa.example.com/labels?refresh=true" \
+  -H "X-Device-Id: MARS_IA"
+```
+
+```json
+{
+  "code": "SUCCESS",
+  "message": "Success get labels",
+  "results": {
+    "labels": [
+      {"label_id": "4", "name": "ATENCION HUMANA", "color": 4, "deleted": false, "is_active": true, "type": "CUSTOM", "predefined_id": 0, "order_index": 0},
+      {"label_id": "5", "name": "MARSIA", "color": 7, "deleted": false, "is_active": true, "type": "CUSTOM", "predefined_id": 0, "order_index": 1}
+    ],
+    "chats": [
+      {"chat_id": "5491112345678@s.whatsapp.net", "chat_lid": "223754944819424@lid", "label_id": "4", "labeled": true}
+    ],
+    "refreshed": true
+  }
+}
+```
+
+```bash
+curl -u "$GOWA_USER:$GOWA_PASS" -X POST "https://gowa.example.com/labels" \
+  -H "X-Device-Id: MARS_IA" -H "Content-Type: application/json" \
+  -d '{"name": "IRRITADO", "color": 2}'
+# PUT  /labels/6   {"name": "CLIENTE IRRITADO"}      rename, keeps color
+# PUT  /labels/6   {"color": 9}                      recolor, keeps name
+# DELETE /labels/6
+```
+
+## Known limitations / edge cases
+
+- **Id allocation is a guess that the server accepted on the dev account.**
+  WhatsApp has no "next id" API; `max + 1` matches what the phone did
+  (13, 14, 15 on one account, 4, 5 on another). Two clients creating
+  labels at the same time on the same account could pick the same id.
+- **`order_index` / `predefined_id`** are set the way the phone sets them
+  for its own custom labels (next index, no predefined id). If a future
+  phone version expects more fields, created labels may render oddly;
+  rename/delete are safe because they resend the phone's own record.
+- **The label limit (20 per Business account)** is enforced by WhatsApp;
+  the API surfaces the rejection as a 500 with the server's error.
+- **A full sync is a real download** (a few hundred ms to a few seconds
+  on a busy account) and holds the label mutex meanwhile; label writes
+  wait for it. Do not call `refresh=true` in a tight loop.
+- **Deleted-label associations** are filtered from `chats` but still
+  exist in the app state; recreating a label with the same id would
+  revive them (ids are never reused by `max + 1`, so this only matters if
+  a client picks ids by hand).
+- **`labeled: false` rows** are returned in `chats` (they are real records
+  in the state); consumers that want "chats with label X" filter on
+  `labeled`.
+- **Regular (non-Business) accounts** have no labels; the sync returns an
+  empty list and writes are ignored by the phone.
 
 ## Keeping the fork in sync with upstream
 

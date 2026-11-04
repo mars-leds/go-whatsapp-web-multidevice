@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp/labelstate"
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -16,64 +16,93 @@ const (
 	eventTypeLabelAssociation = "label.association"
 )
 
-func isLabelAppState(evt *events.AppState) bool {
-	if evt == nil || len(evt.Index) == 0 {
-		return false
+// Fork-specific: label webhooks are built from whatsmeow's typed events
+// (*events.LabelEdit / *events.LabelAssociationChat) instead of the raw
+// *events.AppState upstream used, so that (a) full-sync replays (which
+// GET /labels triggers) can be skipped via FromFullSync and (b) the same
+// events feed the per-client label cache. The webhook payloads are byte-for-
+// byte what upstream emitted: `label.edit` {label_id, name, color,
+// predefined_id, deleted, order_index, is_active, type, is_immutable,
+// mute_end_time_ms} and `label.association` {label_id, labeled, chat_id,
+// chat_lid?}.
+
+func handleLabelEdit(ctx context.Context, evt *events.LabelEdit, deviceID string, client *whatsmeow.Client) {
+	if evt == nil || evt.FromFullSync {
+		return
+	}
+	ts := labelstate.NormalizeEventTime(evt.Timestamp)
+	if client != nil {
+		LabelStateForClient(client).ApplyLabelEdit(evt.LabelID, evt.Action, ts)
 	}
 
-	// Note: IndexLabelAssociationMessage (per-message label) is intentionally excluded.
-	// Only chat-level associations and label edits are forwarded.
-	return evt.Index[0] == appstate.IndexLabelEdit || evt.Index[0] == appstate.IndexLabelAssociationChat
+	payload := buildLabelEditPayload(evt)
+	if payload == nil {
+		return
+	}
+	forwardLabelEventAsync(ctx, eventTypeLabelEdit, payload, ts, deviceID)
 }
 
-func forwardLabelAppStateToWebhook(ctx context.Context, evt *events.AppState, deviceID string, client *whatsmeow.Client) error {
-	eventName, payload := buildLabelAppStatePayload(ctx, evt, client)
-	if eventName == "" {
-		return nil
+func handleLabelAssociation(ctx context.Context, evt *events.LabelAssociationChat, deviceID string, client *whatsmeow.Client) {
+	if evt == nil || evt.FromFullSync {
+		return
+	}
+	ts := labelstate.NormalizeEventTime(evt.Timestamp)
+	if client != nil && evt.Action != nil && !evt.JID.IsEmpty() {
+		LabelStateForClient(client).ApplyAssociation(evt.JID.String(), evt.LabelID, evt.Action.GetLabeled(), ts)
 	}
 
+	payload := buildLabelAssociationPayload(ctx, evt, client)
+	if payload == nil {
+		return
+	}
+	forwardLabelEventAsync(ctx, eventTypeLabelAssociation, payload, ts, deviceID)
+}
+
+func forwardLabelEventAsync(ctx context.Context, eventName string, payload map[string]any, ts time.Time, deviceID string) {
+	go func() {
+		webhookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := forwardLabelEventToWebhook(webhookCtx, eventName, payload, ts, deviceID); err != nil {
+			log.Errorf("Failed to forward %s event to webhook: %v", eventName, err)
+		}
+	}()
+}
+
+func forwardLabelEventToWebhook(ctx context.Context, eventName string, payload map[string]any, ts time.Time, deviceID string) error {
 	body := map[string]any{
 		"event":     eventName,
-		"timestamp": labelAppStateTimestamp(evt),
+		"timestamp": labelEventTimestamp(ts),
 		"payload":   payload,
 	}
 	if deviceID != "" {
 		body["device_id"] = deviceID
 	}
-
 	return forwardPayloadToConfiguredWebhooks(ctx, body, eventName)
 }
 
-func buildLabelAppStatePayload(ctx context.Context, evt *events.AppState, client *whatsmeow.Client) (string, map[string]any) {
-	if evt == nil || evt.SyncActionValue == nil || len(evt.Index) == 0 {
-		return "", nil
+// buildLabelEditPayload returns the `label.edit` payload, or nil when the
+// event carries nothing forwardable.
+func buildLabelEditPayload(evt *events.LabelEdit) map[string]any {
+	if evt == nil || evt.LabelID == "" || evt.Action == nil {
+		return nil
 	}
+	payload := map[string]any{"label_id": evt.LabelID}
+	addLabelEditActionFields(payload, evt.Action)
+	return payload
+}
 
-	switch evt.Index[0] {
-	case appstate.IndexLabelEdit:
-		if len(evt.Index) < 2 || evt.LabelEditAction == nil {
-			return "", nil
-		}
-
-		payload := map[string]any{"label_id": evt.Index[1]}
-		addLabelEditActionFields(payload, evt.LabelEditAction)
-
-		return eventTypeLabelEdit, payload
-	case appstate.IndexLabelAssociationChat:
-		if len(evt.Index) < 3 || evt.LabelAssociationAction == nil {
-			return "", nil
-		}
-
-		payload := map[string]any{
-			"label_id": evt.Index[1],
-			"labeled":  evt.LabelAssociationAction.GetLabeled(),
-		}
-		addLabelChatFields(ctx, client, payload, evt.Index[2])
-
-		return eventTypeLabelAssociation, payload
-	default:
-		return "", nil
+// buildLabelAssociationPayload returns the `label.association` payload, or
+// nil when the event carries nothing forwardable.
+func buildLabelAssociationPayload(ctx context.Context, evt *events.LabelAssociationChat, client *whatsmeow.Client) map[string]any {
+	if evt == nil || evt.LabelID == "" || evt.Action == nil {
+		return nil
 	}
+	payload := map[string]any{
+		"label_id": evt.LabelID,
+		"labeled":  evt.Action.GetLabeled(),
+	}
+	addLabelChatFields(ctx, client, payload, evt.JID)
+	return payload
 }
 
 func addLabelEditActionFields(payload map[string]any, action *waSyncAction.LabelEditAction) {
@@ -106,14 +135,9 @@ func addLabelEditActionFields(payload map[string]any, action *waSyncAction.Label
 	}
 }
 
-func addLabelChatFields(ctx context.Context, client *whatsmeow.Client, payload map[string]any, rawJID string) {
-	jid, err := types.ParseJID(rawJID)
-	if err != nil {
-		payload["chat_id"] = rawJID
-
-		return
-	}
-
+// addLabelChatFields sets chat_id (phone-number JID when resolvable) and,
+// when the index was written with the chat's LID, chat_lid.
+func addLabelChatFields(ctx context.Context, client *whatsmeow.Client, payload map[string]any, jid types.JID) {
 	chatJID := jid.ToNonAD()
 	if chatJID.Server == "lid" {
 		payload["chat_lid"] = chatJID.String()
@@ -121,14 +145,15 @@ func addLabelChatFields(ctx context.Context, client *whatsmeow.Client, payload m
 			chatJID = NormalizeJIDFromLID(ctx, chatJID, client).ToNonAD()
 		}
 	}
-
 	payload["chat_id"] = chatJID.String()
 }
 
-func labelAppStateTimestamp(evt *events.AppState) string {
-	if ts := evt.GetTimestamp(); ts > 0 {
-		return time.UnixMilli(ts).UTC().Format(time.RFC3339)
+// labelEventTimestamp formats an already-normalized event time (see
+// labelstate.NormalizeEventTime: raw values below 1e12 are seconds, zero is
+// "now", so `label.edit` no longer reports 1970).
+func labelEventTimestamp(ts time.Time) string {
+	if ts.IsZero() || ts.UnixMilli() <= 0 {
+		ts = time.Now()
 	}
-
-	return time.Now().UTC().Format(time.RFC3339)
+	return ts.UTC().Format(time.RFC3339)
 }

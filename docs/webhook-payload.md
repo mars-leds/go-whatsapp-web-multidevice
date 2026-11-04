@@ -567,6 +567,9 @@ Triggered when a user starts typing in a group chat.
 Label events are triggered when WhatsApp label metadata changes or a label is applied to or removed from a chat. These
 events come from WhatsApp app-state sync and are forwarded as `label.edit` or `label.association`.
 
+Fork note: the full resync that `GET /labels` runs re-emits every label record internally, but those replays are
+**not** forwarded as webhooks; only incremental changes are. The payloads are unchanged from upstream.
+
 ### Label Edit
 
 Triggered when a WhatsApp label is created, renamed, reordered, activated/deactivated, or deleted.
@@ -614,7 +617,7 @@ Triggered when a chat-level label is applied to or removed from a chat.
 |--------------------------|----------|----------------------------------------------------------------------------------|
 | `event`                  | string   | `"label.edit"` for label metadata changes, or `"label.association"` for chat labels |
 | `device_id`              | string   | JID of the device that received this event                                       |
-| `timestamp`              | string   | RFC3339 formatted timestamp from the app-state event, or processing time fallback |
+| `timestamp`              | string   | RFC3339 formatted timestamp from the app-state event, or processing time fallback. Fork: raw values below 1e12 are read as seconds (the phone stamps `label_edit` that way; upstream reported them as 1970), zero falls back to processing time |
 | `payload.label_id`       | string   | WhatsApp label identifier                                                        |
 | `payload.name`           | string   | Label display name (only when included by WhatsApp on `label.edit`)              |
 | `payload.color`          | number   | Label color value (only when included by WhatsApp on `label.edit`)               |

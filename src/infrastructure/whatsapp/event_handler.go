@@ -11,6 +11,7 @@ import (
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainDevice "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/device"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp/labelstate"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp/mediaretry"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/websocket"
 	"github.com/sirupsen/logrus"
@@ -47,6 +48,7 @@ func handler(ctx context.Context, instance *DeviceInstance, rawEvt any) {
 	case *events.PairPasskeyError:
 		handlePairPasskeyError(instance, evt)
 	case *events.LoggedOut:
+		labelstate.Forget(client) // Fork-specific: drop the label cache of this session.
 		handleLoggedOut(instance)
 	case *events.Connected, *events.PushNameSetting:
 		handleConnectionEvents(ctx, client, instance)
@@ -68,6 +70,12 @@ func handler(ctx context.Context, instance *DeviceInstance, rawEvt any) {
 		handleHistorySync(ctx, evt, chatStorageRepo, client)
 	case *events.AppState:
 		handleAppState(ctx, evt, instance.JID(), client)
+	case *events.LabelEdit:
+		// Fork-specific: label webhooks come from the typed events (see
+		// event_label.go) so full-sync replays can be skipped.
+		handleLabelEdit(ctx, evt, instance.JID(), client)
+	case *events.LabelAssociationChat:
+		handleLabelAssociation(ctx, evt, instance.JID(), client)
 	case *events.GroupInfo:
 		handleGroupInfo(ctx, evt, instance.JID(), client)
 	case *events.JoinedGroup:
@@ -351,18 +359,10 @@ func handlePresence(_ context.Context, evt *events.Presence) {
 	}
 }
 
-func handleAppState(ctx context.Context, evt *events.AppState, deviceID string, client *whatsmeow.Client) {
+func handleAppState(_ context.Context, evt *events.AppState, _ string, _ *whatsmeow.Client) {
 	log.Debugf("App state event: %+v / %+v", evt.Index, evt.SyncActionValue)
-
-	if isLabelAppState(evt) {
-		go func(e *events.AppState, c *whatsmeow.Client) {
-			webhookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer cancel()
-			if err := forwardLabelAppStateToWebhook(webhookCtx, e, deviceID, c); err != nil {
-				logrus.Errorf("Failed to forward label appstate event to webhook: %v", err)
-			}
-		}(evt, client)
-	}
+	// Fork-specific: label events are no longer forwarded from here; see the
+	// *events.LabelEdit / *events.LabelAssociationChat cases in handler().
 }
 
 func handleGroupInfo(ctx context.Context, evt *events.GroupInfo, deviceID string, client *whatsmeow.Client) {

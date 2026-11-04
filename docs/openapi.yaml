@@ -3137,11 +3137,18 @@ paths:
         all linked devices and this instance then emits a
         `label.association` webhook event for it.
 
-        The label must already exist on the phone (create it from the
-        WhatsApp Business app); `label_id` is the id reported by the
-        `label.edit` / `label.association` webhook events. `label_name`
-        is informational only (echoed in the response and logs) and is
-        not used to create or rename the label.
+        The label must already exist (`POST /labels`, or created from the
+        WhatsApp Business app); `label_id` is the id reported by
+        `GET /labels` and by the `label.edit` / `label.association` webhook
+        events. `label_name` is informational only (echoed in the response
+        and logs) and is not used to create or rename the label.
+
+        Index form: the phone stores chat labels under the chat's LID.
+        Applying writes the LID form when it is known (falling back to the
+        phone number); removing writes both the LID and the phone-number
+        forms in one patch, so a label the phone applied (LID) or an older
+        build applied (number) is cleared either way. The response reports
+        the LID used in `chat_lid`.
       parameters:
         - $ref: '#/components/parameters/DeviceIdHeader'
         - in: path
@@ -3194,6 +3201,227 @@ paths:
                 $ref: '#/components/schemas/ErrorUnauthorized'
         '500':
           description: Internal Server Error (e.g. WhatsApp rejected the app state patch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+
+  /labels:
+    get:
+      operationId: listLabels
+      tags:
+        - chat
+      summary: List labels and chat associations (fork)
+      description: |
+        Fork-specific endpoint. Returns the WhatsApp (Business) labels and
+        the chat<->label associations of the `regular` app state collection.
+
+        whatsmeow does not persist label names or associations, so the data
+        comes from an in-memory per-session cache: the first call after
+        start/login (or `refresh=true`) runs a full resync of the collection
+        from the WhatsApp server (a few seconds; the collection only holds
+        label data, not mute/pin/archive/contacts), later calls are served
+        from the cache, which the incremental `label.edit` /
+        `label.association` events keep up to date. The resync does not
+        re-fire webhook events.
+
+        Use `refresh=true` after a reconnection that may have missed app
+        state patches, or as a periodic reconciliation.
+
+        Associations are normalized: the phone writes them under the chat's
+        LID, this fork's older builds under the phone number; both forms
+        are merged into one row per (chat, label) (the most recent record
+        wins), `chat_lid` reports the LID when there was one, and
+        associations of deleted labels are dropped.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - in: query
+          name: refresh
+          schema:
+            type: boolean
+            default: false
+          description: Force a full resync of the `regular` collection before answering
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListLabelsResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorUnauthorized'
+        '500':
+          description: Internal Server Error (not logged in, full sync failed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+    post:
+      operationId: createLabel
+      tags:
+        - chat
+      summary: Create a label (fork)
+      description: |
+        Fork-specific endpoint. Creates a WhatsApp (Business) label by
+        writing a `label_edit` record (name, color, not deleted, active,
+        type CUSTOM, next order index). The id is chosen by this endpoint
+        as the highest known id plus one (deleted labels keep their ids),
+        after making sure the cache is complete (see `GET /labels`).
+
+        WhatsApp Business allows up to 20 labels per account; the server
+        may reject the patch beyond that.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  example: 'IRRITADO'
+                color:
+                  type: integer
+                  minimum: 0
+                  maximum: 19
+                  default: 0
+                  description: WhatsApp Business palette index
+                  example: 7
+              required:
+                - name
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LabelMutationResponse'
+        '400':
+          description: Bad Request (missing name, color out of range)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorUnauthorized'
+        '500':
+          description: Internal Server Error (not logged in, WhatsApp rejected the patch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /labels/{label_id}:
+    put:
+      operationId: updateLabel
+      tags:
+        - chat
+      summary: Rename and/or recolor a label (fork)
+      description: |
+        Fork-specific endpoint. A `label_edit` SET replaces the whole record,
+        so the full last known record of the label is resent with only
+        `name` / `color` changed. At least one of them is required. The
+        route `label_id` is authoritative over any body value.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - in: path
+          name: label_id
+          schema:
+            type: string
+          required: true
+          example: '13'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  example: 'ATENCION HUMANA'
+                color:
+                  type: integer
+                  minimum: 0
+                  maximum: 19
+                  example: 4
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LabelMutationResponse'
+        '400':
+          description: Bad Request (nothing to change, empty name, color out of range)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorUnauthorized'
+        '404':
+          description: Label not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
+        '500':
+          description: Internal Server Error (not logged in, WhatsApp rejected the patch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+    delete:
+      operationId: deleteLabel
+      tags:
+        - chat
+      summary: Delete a label (fork)
+      description: |
+        Fork-specific endpoint. Marks the label deleted (`deleted: true` on
+        its full last known record). Like WhatsApp itself, this does not
+        touch the chat associations of the label; `GET /labels` filters
+        them out.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - in: path
+          name: label_id
+          schema:
+            type: string
+          required: true
+          example: '13'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LabelMutationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorUnauthorized'
+        '404':
+          description: Label not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorNotFound'
+        '500':
+          description: Internal Server Error (not logged in, WhatsApp rejected the patch)
           content:
             application/json:
               schema:
@@ -6211,6 +6439,10 @@ components:
             chat_jid:
               type: string
               example: '6289685028129@s.whatsapp.net'
+            chat_lid:
+              type: string
+              description: The chat's LID when known (the index form the association was written with). Omitted otherwise.
+              example: '223754944819424@lid'
             label_id:
               type: string
               example: '7'
@@ -6220,6 +6452,101 @@ components:
             labeled:
               type: boolean
               example: true
+    Label:
+      type: object
+      description: A WhatsApp (Business) label as last seen in the `regular` app state collection. Field names match the `label.edit` webhook payload.
+      properties:
+        label_id:
+          type: string
+          example: '13'
+        name:
+          type: string
+          example: 'ATENCION HUMANA'
+        color:
+          type: integer
+          description: WhatsApp Business palette index (0-19)
+          example: 4
+        deleted:
+          type: boolean
+          example: false
+        is_active:
+          type: boolean
+          example: true
+        type:
+          type: string
+          description: WhatsApp label type as reported by the phone (`CUSTOM` for user labels, `PREDEFINED`, ...). Empty when WhatsApp did not send it.
+          example: 'CUSTOM'
+        predefined_id:
+          type: integer
+          example: 0
+        order_index:
+          type: integer
+          example: 2
+    ChatLabel:
+      type: object
+      description: One chat<->label association after LID->phone-number normalization. Field names match the `label.association` webhook payload.
+      properties:
+        chat_id:
+          type: string
+          description: Chat JID (phone number form when the LID could be resolved, the LID itself otherwise, group JID for groups)
+          example: '6289685028129@s.whatsapp.net'
+        chat_lid:
+          type: string
+          description: Present when the phone stored the association under the chat's LID
+          example: '223754944819424@lid'
+        label_id:
+          type: string
+          example: '13'
+        labeled:
+          type: boolean
+          description: Current state of the association. `false` entries are chats that had the label removed.
+          example: true
+    ListLabelsResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: Success get labels
+        results:
+          type: object
+          properties:
+            labels:
+              type: array
+              description: Every known label, deleted ones included (`deleted: true`), sorted by numeric id
+              items:
+                $ref: '#/components/schemas/Label'
+            chats:
+              type: array
+              description: Associations of non-deleted labels, one per (chat, label), sorted by chat_id then label_id
+              items:
+                $ref: '#/components/schemas/ChatLabel'
+            refreshed:
+              type: boolean
+              description: Whether this call ran a full resync of the `regular` collection
+              example: true
+    LabelMutationResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: "Label 'IRRITADO' created with id 16"
+        results:
+          type: object
+          properties:
+            status:
+              type: string
+              example: success
+            message:
+              type: string
+              example: "Label 'IRRITADO' created with id 16"
+            label:
+              $ref: '#/components/schemas/Label'
     SetDisappearingTimerResponse:
       type: object
       properties:
