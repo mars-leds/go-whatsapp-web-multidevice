@@ -1,4 +1,13 @@
-# Fork changes: `media-retry` endpoint
+# Fork changes
+
+This fork of
+[`aldinokemal/go-whatsapp-web-multidevice`](https://github.com/aldinokemal/go-whatsapp-web-multidevice)
+adds two REST endpoints: [`media-retry`](#media-retry-endpoint) and
+[`chat label`](#chat-label-endpoint). Both follow the same rules: new
+files for the feature, minimal edits to upstream files marked with
+`// Fork-specific:` comments, documented in `docs/openapi.yaml`.
+
+# `media-retry` endpoint
 
 This fork of
 [`aldinokemal/go-whatsapp-web-multidevice`](https://github.com/aldinokemal/go-whatsapp-web-multidevice)
@@ -125,6 +134,118 @@ Timeout response (504):
 - **Concurrent retries for the same `message_id`**: the later caller
   wins; the earlier one stops receiving the notification and ends with
   its own timeout (504).
+
+# Chat label endpoint
+
+Adds `POST /chat/{chat_jid}/label` with body
+`{"label_id": "...", "label_name": "...", "labeled": true|false}`
+(operationId `labelChat`), which applies or removes a WhatsApp (Business)
+label on a chat.
+
+## Why
+
+Upstream *documented* this exact operation in `docs/openapi.yaml` from
+v6.8.0 (PR #341, the pin/unpin feature, 2025-07-12) to v8.10.0, but
+never implemented it: there was no handler, usecase or validation for it
+in any release, and the phantom entry was dropped from the spec in the
+docs cleanup commit `8b73125` (2026-07-03, "docs: update API and webhook
+documentation"), the same commit that documented the `label.edit` /
+`label.association` webhook events added by PR #659. So on every gowa
+version the route answers 404. This fork implements it with the contract
+upstream had published.
+
+## What's added (files)
+
+| File | Change | Purpose |
+| --- | --- | --- |
+| `src/domains/chat/chat_label.go` | new | `LabelChatRequest` / `LabelChatResponse` DTOs. `labeled` is a `*bool` so a missing field is rejected instead of silently unlabeling. |
+| `src/domains/chat/interfaces.go` | +3 lines | Adds `LabelChat(...)` to `IChatUsecase`. |
+| `src/validations/chat_label_validation.go` | new | `chat_jid`, `label_id`, `label_name` required; `labeled` not nil. |
+| `src/usecase/chat_label.go` | new | Service impl: `appstate.BuildLabelChat` + `client.SendAppState`, mirroring `PinChat` / `ArchiveChat`. |
+| `src/ui/rest/chat_label.go` | new | Fiber (v3) handler; route `chat_jid` is authoritative over the body. |
+| `src/ui/rest/chat.go` | +2 lines | Registers `POST /chat/:chat_jid/label`. |
+| `src/ui/rest/chat_test.go` | +5 lines | The existing usecase stub gains the new interface method. |
+| `docs/openapi.yaml` | +1 path, +1 schema | Documents the endpoint (`LabelChatResponse`). |
+| `src/validations/chat_label_validation_test.go`, `src/usecase/chat_label_test.go`, `src/ui/rest/chat_label_test.go` | new | Unit tests for validation, the whatsmeow patch shape and the handler. |
+
+## How it works
+
+```
+POST /chat/{chat_jid}/label  {label_id, label_name, labeled}
+   |
+   | 1. validate body, resolve chat_jid (LID -> PN) + require login
+   | 2. appstate.BuildLabelChat(jid, label_id, labeled)
+   |      -> PatchInfo{Type: regular, Index: [label_jid, label_id, jid],
+   |                   LabelAssociationAction{Labeled}}
+   | 3. client.SendAppState(ctx, patch)   (IQ w:sync:app:state, type=set)
+   | 4. phone applies it, fans it out to all devices, whatsmeow resyncs
+   |    `regular` and emits events.AppState -> webhook `label.association`
+   v
+JSON {status, message, chat_jid, label_id, label_name, labeled}
+```
+
+It is the same round-trip `/chat/{chat_jid}/pin` (`BuildPin`) and
+`/chat/{chat_jid}/archive` (`BuildArchive`) already use; the only
+difference is the collection (`regular` instead of `regular_low`) and
+the mutation index.
+
+## HTTP status map
+
+| Code | When |
+| --- | --- |
+| 200 | Patch accepted by the WhatsApp server. |
+| 400 | Malformed JSON, missing `label_id` / `label_name` / `labeled`, bad `chat_jid`. |
+| 401 | Basic auth. |
+| 500 | Not logged in, `SendAppState` error (server rejected the patch, app state keys missing, LTHash mismatch, ...). |
+
+## Example
+
+```bash
+curl -u "$GOWA_USER:$GOWA_PASS" \
+  -X POST "https://gowa.example.com/chat/5491112345678%40s.whatsapp.net/label" \
+  -H "X-Device-Id: SOPORTE_FABIAN" \
+  -H "Content-Type: application/json" \
+  -d '{"label_id": "7", "label_name": "Derivado", "labeled": true}'
+```
+
+Successful response:
+
+```json
+{
+  "code": "SUCCESS",
+  "message": "Chat labeled successfully with label 'Derivado'",
+  "results": {
+    "status": "success",
+    "message": "Chat labeled successfully with label 'Derivado'",
+    "chat_jid": "5491112345678@s.whatsapp.net",
+    "label_id": "7",
+    "label_name": "Derivado",
+    "labeled": true
+  }
+}
+```
+
+## Known limitations / edge cases
+
+- **The label must already exist.** The endpoint only writes the
+  chat<->label association. Creating/renaming/deleting labels
+  (`appstate.BuildLabelEdit`) is deliberately not exposed, so the
+  `label_name` in the body cannot create a label; it is echoed back only.
+  Get the ids from the `label.edit` webhook events (fired on connect
+  when the `regular` app state is synced) or from the phone.
+- **Regular (non-Business) accounts** have no labels; the server may
+  accept the patch and the phone will simply ignore it.
+- **No local read-back.** gowa does not persist label associations, so
+  there is no `GET`; rely on the `label.association` webhook event that
+  follows a successful patch as the confirmation.
+- **JID form.** The association is indexed by the JID the caller passes
+  (after LID -> phone-number resolution, like `/pin`). Chats that the
+  phone stores by LID may show the label under the LID key in webhook
+  events (`chat_lid`); labeling by `@lid` directly is untested.
+- **App state keys.** `SendAppState` reuses the primary device's app
+  state sync key (whatsmeow TODO). If the session has no synced keys yet
+  (fresh pairing, before the first `regular` sync) it fails with
+  `no app state keys found`; retry after the initial sync.
 
 ## Keeping the fork in sync with upstream
 

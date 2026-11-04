@@ -15,4 +15,7 @@ type IChatUsecase interface {
 	// for older messages of a chat, anchored at the oldest message currently
 	// stored for that chat.
 	RequestChatHistory(ctx context.Context, request RequestChatHistoryRequest) (response RequestChatHistoryResponse, err error)
+	// LabelChat applies or removes a WhatsApp label on a chat via an app
+	// state patch (appstate.BuildLabelChat). Fork-specific.
+	LabelChat(ctx context.Context, request LabelChatRequest) (response LabelChatResponse, err error)
 }

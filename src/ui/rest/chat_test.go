@@ -108,6 +108,11 @@ func (s *requestChatHistorySpy) ArchiveChat(context.Context, domainChat.ArchiveC
 	return domainChat.ArchiveChatResponse{}, nil
 }
 
+// Fork-specific: LabelChat is part of the interface (see chat_label.go).
+func (s *requestChatHistorySpy) LabelChat(context.Context, domainChat.LabelChatRequest) (domainChat.LabelChatResponse, error) {
+	return domainChat.LabelChatResponse{}, nil
+}
+
 func (s *requestChatHistorySpy) RequestChatHistory(_ context.Context, request domainChat.RequestChatHistoryRequest) (domainChat.RequestChatHistoryResponse, error) {
 	s.calls++
 	s.lastRequest = request
