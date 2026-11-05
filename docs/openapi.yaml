@@ -3237,6 +3237,15 @@ paths:
         or both in one patch (`both`). Without a known LID every form
         writes the phone number. The response reports a LID in `chat_lid`
         when one was written.
+
+        Drifted collection: on old accounts the local copy of `regular_low`
+        can be out of sync with the server (the write gets a 409 and the
+        conflict patches fail LTHash verification). The endpoint then
+        full-syncs `regular_low` (which emits no events and never touches
+        labels, they live in `regular`) and retries the write once;
+        `resynced: true` in the response says it did. `resync: true` (body
+        or `?resync=true`) forces that full sync before writing, as a
+        manual repair.
       parameters:
         - $ref: '#/components/parameters/DeviceIdHeader'
         - in: path
@@ -3246,6 +3255,13 @@ paths:
           required: true
           description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group). Percent-encoded values (e.g., groupid%40g.us) are accepted.
           example: '6289685028129@s.whatsapp.net'
+        - in: query
+          name: resync
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Same as the body field `resync`. Only the literal `true` counts.
       requestBody:
         required: false
         content:
@@ -3263,6 +3279,10 @@ paths:
                   enum: [pn, lid, both]
                   default: pn
                   description: Index key form to write the mutation under. See description.
+                resync:
+                  type: boolean
+                  default: false
+                  description: Force a full sync of the `regular_low` app state collection before writing (manual repair of a drifted collection). Without it the endpoint resyncs and retries once on its own when the write is rejected as out of sync.
       responses:
         '200':
           description: OK
@@ -3283,7 +3303,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorUnauthorized'
         '500':
-          description: Internal Server Error (e.g. WhatsApp rejected the app state patch)
+          description: Internal Server Error (e.g. WhatsApp rejected the app state patch, also after the automatic resync and retry; the message carries whatsmeow's full error text)
           content:
             application/json:
               schema:
@@ -6572,6 +6592,10 @@ components:
               type: string
               description: Id of that message (the key sent in the range). Omitted when the chat has no stored message.
               example: '3EB0C767D26A1D8E4F1A'
+            resynced:
+              type: boolean
+              description: true when the `regular_low` collection was fully resynced during this call (requested with `resync`, or triggered by a write rejected as out of sync). Omitted when false.
+              example: false
     Label:
       type: object
       description: A WhatsApp (Business) label as last seen in the `regular` app state collection. Field names match the `label.edit` webhook payload.

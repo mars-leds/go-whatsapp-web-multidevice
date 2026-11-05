@@ -287,7 +287,8 @@ gowa exposes neither.
 | `src/domains/chat/chat_unread.go` | new | `UnreadChatRequest` / `UnreadChatResponse`, `jid_form` constants. |
 | `src/domains/chat/interfaces.go` | +3 lines | `UnreadChat` on `IChatUsecase`. |
 | `src/validations/chat_unread_validation.go` | new | `chat_jid` required, `jid_form` in {pn, lid, both}. |
-| `src/usecase/chat_unread.go` | new | Resolves the JID, looks up the chat's newest stored message, builds and sends the patch under the per-device app state mutex. |
+| `src/usecase/chat_unread.go` | new | Resolves the JID, looks up the chat's newest stored message, builds and sends the patch under the per-device app state mutex; full-syncs `regular_low` and retries once when the write is rejected as out of sync (or on `resync: true`). |
+| `src/infrastructure/whatsapp/appstate_resync.go` | new | `IsAppStateOutOfSync` (409 / mismatching LTHash) and `FullSyncAppState` (reset + snapshot of one collection, no events). |
 | `src/ui/rest/chat_unread.go` | new | Fiber handler (empty body allowed). |
 | `src/ui/rest/chat.go` | +1 line | Route. |
 | `src/infrastructure/whatsapp/event_read_state.go` | new | `chat.read_state` webhook from `*events.MarkChatAsRead` (skips `FromFullSync`). |
@@ -299,8 +300,8 @@ gowa exposes neither.
 ## How it works
 
 1. `POST /chat/{chat_jid}/unread` with an optional body
-   `{"unread": true|false, "jid_form": "pn"|"lid"|"both"}` (empty body =
-   unread, `pn`).
+   `{"unread": true|false, "jid_form": "pn"|"lid"|"both", "resync": bool}`
+   (empty body = unread, `pn`, no forced resync; `?resync=true` works too).
 2. The usecase validates, resolves the JID (an `@lid` input is resolved to
    its number), takes the per-device app state write mutex (the one the
    labels API uses), and looks up the newest message stored for the chat
@@ -309,6 +310,9 @@ gowa exposes neither.
    per index key (`jid_form`) into one `regular_low` patch and sends it
    with `SendAppState`. Without a stored message the range is "now" with
    no key (whatsmeow's own default).
+   If the server rejects the write as out of sync (see "Drifted
+   `regular_low`" below) the usecase full-syncs the collection and retries
+   once; with `resync: true` the full sync runs before the first attempt.
 4. The phone applies it, echoes the mutation back, and whatsmeow
    dispatches `*events.MarkChatAsRead`, which `event_read_state.go` turns
    into a `chat.read_state` webhook (`{chat_id, chat_lid?, read,
@@ -325,7 +329,7 @@ and they still surface as `message.ack`.
 | 200 | OK. |
 | 400 | Malformed JSON, bad `chat_jid`, `jid_form` outside {pn, lid, both}. |
 | 401 | Basic auth. |
-| 500 | Not logged in, `SendAppState` rejected (patch error, no app state keys, LTHash mismatch). |
+| 500 | Not logged in, `SendAppState` rejected (patch error, no app state keys), or rejected as out of sync even after the automatic resync + retry. The message is whatsmeow's full error text (it is what tells a drifted collection from anything else). |
 
 ## Example
 
@@ -349,6 +353,51 @@ curl -u "$GOWA_USER:$GOWA_PASS" -X POST \
   }
 }
 ```
+
+`"resynced": true` appears in `results` when the collection was fully
+resynced during the call.
+
+## Drifted `regular_low` (old accounts)
+
+On a long-lived account (years of patches, many client versions) the
+local copy of the `regular_low` collection can drift from the server's.
+The symptom is a 500 on this endpoint with:
+
+```
+server returned error updating app state (regular_low): <error code="409" text="conflict"/>
+(also, applying patches in the response failed: failed to decode app state regular_low patches:
+failed to verify patch v188: mismatching LTHash)
+```
+
+whatsmeow handles the 409 by applying the conflict patches the server
+sends back and retrying, but those patches fail LTHash verification
+against the drifted local state, and the regular incremental sync
+(`handleAppStateNotification` -> `FetchAppState` without full sync) only
+logs the same error: whatsmeow never full-syncs on its own. A fresh
+account never hits this, which is why it only showed up in production.
+
+The repair is a full sync of that one collection
+(`client.FetchAppState(ctx, WAPatchRegularLow, fullSync=true, false)`:
+reset the local version, download the snapshot). The usecase does it on
+its own, under the same per-device app state mutex, when `SendAppState`
+returns an error wrapping `whatsmeow.ErrAppStateUpdate` or
+`appstate.ErrMismatchingLTHash`, then retries the write once; the resync
+is logged with device, collection and previous local version, and the
+response carries `resynced: true`. `resync: true` forces it before the
+first attempt (manual repair). If the retry fails too, the 500 carries
+whatsmeow's full error text, untouched.
+
+Notes:
+
+- A full sync of `regular_low` **emits no events** (gowa leaves
+  `EmitAppStateEventsOnFullSync` at false, and `FullSyncAppState` does not
+  raise it, unlike `FullSyncLabels`), so no webhook fires for the pins /
+  archives / read marks of the snapshot.
+- It **never touches labels**: those live in the `regular` collection.
+- The same drift could one day hit `regular` and break the label writes
+  with the same error. The manual repair already exists there:
+  `GET /labels?refresh=true` (`FullSyncLabels`); the automatic retry is
+  only wired into this endpoint for now.
 
 ## Known limitations / edge cases
 

@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	domainChat "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chat"
@@ -63,14 +64,28 @@ func (service serviceChat) UnreadChat(ctx context.Context, request domainChat.Un
 	lid := whatsapp.LIDForPN(ctx, targetJID, client)
 	indexJIDs := unreadChatIndexJIDs(targetJID, lid, form)
 
-	lastTS, lastKey, lastID := service.lastMessageRange(deviceIDFromContext(ctx), targetJID, lid)
+	deviceID := deviceIDFromContext(ctx)
+	lastTS, lastKey, lastID := service.lastMessageRange(deviceID, targetJID, lid)
 	patch := buildMarkChatAsReadPatch(indexJIDs, !unread, lastTS, lastKey)
 
-	if err = client.SendAppState(ctx, patch); err != nil {
+	resynced, err := sendAppStateWithResync(ctx, request.Resync,
+		func(ctx context.Context) error { return client.SendAppState(ctx, patch) },
+		func(ctx context.Context) error {
+			previous, err := whatsapp.FullSyncAppState(ctx, client, appstate.WAPatchRegularLow)
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"device_id":        deviceID,
+				"collection":       appstate.WAPatchRegularLow,
+				"previous_version": previous,
+				"chat_jid":         request.ChatJID,
+			}).Info("Full resync of app state collection for mark chat as read")
+			return err
+		})
+	if err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{
 			"chat_jid":   request.ChatJID,
 			"index_jids": indexJIDs,
 			"unread":     unread,
+			"resynced":   resynced,
 		}).Error("Failed to send mark chat as read app state")
 		return response, err
 	}
@@ -89,6 +104,7 @@ func (service serviceChat) UnreadChat(ctx context.Context, request domainChat.Un
 	response.Unread = unread
 	response.LastMessageTimestamp = lastTS.UTC().Format(time.RFC3339)
 	response.LastMessageID = lastID
+	response.Resynced = resynced
 	if unread {
 		response.Message = "Chat marked as unread successfully"
 	} else {
@@ -100,9 +116,35 @@ func (service serviceChat) UnreadChat(ctx context.Context, request domainChat.Un
 		"chat_lid":        response.ChatLID,
 		"unread":          unread,
 		"last_message_id": lastID,
+		"resynced":        resynced,
 	}).Info("Chat unread operation completed successfully")
 
 	return response, nil
+}
+
+// sendAppStateWithResync runs send and, when the server rejects the write
+// because the local copy of the collection drifted (409 / mismatching
+// LTHash, see whatsapp.IsAppStateOutOfSync), full-syncs the collection and
+// retries send exactly once. With force the resync happens before the
+// first send (manual repair). It reports whether a resync ran. The error of
+// a failed retry is returned whole, as whatsmeow built it, since that text
+// is what tells a drifted collection from any other rejection.
+func sendAppStateWithResync(ctx context.Context, force bool, send, resync func(context.Context) error) (resynced bool, err error) {
+	if force {
+		if err = resync(ctx); err != nil {
+			return false, err
+		}
+		resynced = true
+	}
+	err = send(ctx)
+	if err == nil || resynced || !whatsapp.IsAppStateOutOfSync(err) {
+		return resynced, err
+	}
+	logrus.WithError(err).Warn("App state write rejected as out of sync, full-syncing the collection and retrying once")
+	if resyncErr := resync(ctx); resyncErr != nil {
+		return false, fmt.Errorf("%w (also, the full resync of the collection failed: %w)", err, resyncErr)
+	}
+	return true, send(ctx)
 }
 
 // unreadChatIndexJIDs picks the `markChatAsRead` index keys to write for the

@@ -29,6 +29,12 @@ type UnreadChatRequest struct {
 	// "pn" (default), "lid" or "both". See FORK_CHANGES.md for which form
 	// the phone honours.
 	JIDForm string `json:"jid_form"`
+	// Resync forces a full sync of the `regular_low` app state collection
+	// before writing (also accepted as the query param ?resync=true). The
+	// usecase does the same on its own, once, when the server rejects the
+	// write because the local copy of the collection drifted (409 /
+	// mismatching LTHash); this flag is the manual repair.
+	Resync bool `json:"resync"`
 }
 
 type UnreadChatResponse struct {
@@ -46,4 +52,7 @@ type UnreadChatResponse struct {
 	// LastMessageID is the id of that message (the key sent in the
 	// range), omitted when the chat has no stored message.
 	LastMessageID string `json:"last_message_id,omitempty"`
+	// Resynced is true when the `regular_low` collection was fully resynced
+	// during this call (requested or triggered by a rejected write).
+	Resynced bool `json:"resynced,omitempty"`
 }

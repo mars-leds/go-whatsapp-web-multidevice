@@ -3,6 +3,8 @@ package usecase
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -146,4 +149,79 @@ func TestUnreadChatRequiresClient(t *testing.T) {
 	assert.Equal(t, pkgError.ValidationError("jid_form: must be a valid value."), err)
 	_, err = service.UnreadChat(ctx, domainChat.UnreadChatRequest{ChatJID: "5491112345678@s.whatsapp.net"})
 	assert.Equal(t, pkgError.ErrWaCLI, err)
+}
+
+func TestSendAppStateWithResync(t *testing.T) {
+	outOfSync := fmt.Errorf("%w (%s): %s", whatsmeow.ErrAppStateUpdate, appstate.WAPatchRegularLow, `<error code="409" text="conflict"/>`)
+	other := errors.New("no app state keys found, creating app state keys is not yet supported")
+
+	run := func(force bool, sendErrs []error, resyncErr error) (bool, error, []string) {
+		var trace []string
+		sends := 0
+		send := func(context.Context) error {
+			trace = append(trace, "send")
+			var err error
+			if sends < len(sendErrs) {
+				err = sendErrs[sends]
+			}
+			sends++
+			return err
+		}
+		resync := func(context.Context) error {
+			trace = append(trace, "resync")
+			return resyncErr
+		}
+		resynced, err := sendAppStateWithResync(context.Background(), force, send, resync)
+		return resynced, err, trace
+	}
+
+	// Happy path: one send, no resync.
+	resynced, err, trace := run(false, nil, nil)
+	assert.NoError(t, err)
+	assert.False(t, resynced)
+	assert.Equal(t, []string{"send"}, trace)
+
+	// Out of sync: resync, retry once, success.
+	resynced, err, trace = run(false, []error{outOfSync, nil}, nil)
+	assert.NoError(t, err)
+	assert.True(t, resynced)
+	assert.Equal(t, []string{"send", "resync", "send"}, trace)
+
+	// Out of sync twice: the retry's error comes back whole, no third try.
+	resynced, err, trace = run(false, []error{outOfSync, outOfSync}, nil)
+	assert.ErrorIs(t, err, whatsmeow.ErrAppStateUpdate)
+	assert.Equal(t, outOfSync, err, "retry error returned as whatsmeow built it")
+	assert.True(t, resynced)
+	assert.Equal(t, []string{"send", "resync", "send"}, trace)
+
+	// Out of sync and the resync itself fails: both errors, no retry.
+	resyncFailed := errors.New("full sync of app state regular_low failed: boom")
+	resynced, err, trace = run(false, []error{outOfSync}, resyncFailed)
+	assert.ErrorIs(t, err, whatsmeow.ErrAppStateUpdate)
+	assert.ErrorIs(t, err, resyncFailed)
+	assert.False(t, resynced)
+	assert.Equal(t, []string{"send", "resync"}, trace)
+
+	// Any other rejection is returned as is, no resync.
+	resynced, err, trace = run(false, []error{other}, nil)
+	assert.Equal(t, other, err)
+	assert.False(t, resynced)
+	assert.Equal(t, []string{"send"}, trace)
+
+	// Forced: resync first, then one send; a rejection after a forced
+	// resync is not retried.
+	resynced, err, trace = run(true, nil, nil)
+	assert.NoError(t, err)
+	assert.True(t, resynced)
+	assert.Equal(t, []string{"resync", "send"}, trace)
+	resynced, err, trace = run(true, []error{outOfSync}, nil)
+	assert.Equal(t, outOfSync, err)
+	assert.True(t, resynced)
+	assert.Equal(t, []string{"resync", "send"}, trace)
+
+	// Forced and the resync fails: nothing is sent.
+	resynced, err, trace = run(true, nil, resyncFailed)
+	assert.Equal(t, resyncFailed, err)
+	assert.False(t, resynced)
+	assert.Equal(t, []string{"resync"}, trace)
 }
