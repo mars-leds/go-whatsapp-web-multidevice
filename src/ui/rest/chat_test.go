@@ -113,6 +113,11 @@ func (s *requestChatHistorySpy) LabelChat(context.Context, domainChat.LabelChatR
 	return domainChat.LabelChatResponse{}, nil
 }
 
+// Fork-specific: UnreadChat is part of the interface (see chat_unread.go).
+func (s *requestChatHistorySpy) UnreadChat(context.Context, domainChat.UnreadChatRequest) (domainChat.UnreadChatResponse, error) {
+	return domainChat.UnreadChatResponse{}, nil
+}
+
 func (s *requestChatHistorySpy) RequestChatHistory(_ context.Context, request domainChat.RequestChatHistoryRequest) (domainChat.RequestChatHistoryResponse, error) {
 	s.calls++
 	s.lastRequest = request

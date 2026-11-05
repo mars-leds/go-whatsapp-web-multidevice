@@ -18,4 +18,7 @@ type IChatUsecase interface {
 	// LabelChat applies or removes a WhatsApp label on a chat via an app
 	// state patch (appstate.BuildLabelChat). Fork-specific.
 	LabelChat(ctx context.Context, request LabelChatRequest) (response LabelChatResponse, err error)
+	// UnreadChat marks a chat as unread/read on the account's own devices via
+	// an app state patch (appstate.BuildMarkChatAsRead). Fork-specific.
+	UnreadChat(ctx context.Context, request UnreadChatRequest) (response UnreadChatResponse, err error)
 }

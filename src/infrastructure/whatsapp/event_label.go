@@ -39,7 +39,7 @@ func handleLabelEdit(ctx context.Context, evt *events.LabelEdit, deviceID string
 	if payload == nil {
 		return
 	}
-	forwardLabelEventAsync(ctx, eventTypeLabelEdit, payload, ts, deviceID)
+	forwardAppStateEventAsync(ctx, eventTypeLabelEdit, payload, ts, deviceID)
 }
 
 func handleLabelAssociation(ctx context.Context, evt *events.LabelAssociationChat, deviceID string, client *whatsmeow.Client) {
@@ -55,20 +55,22 @@ func handleLabelAssociation(ctx context.Context, evt *events.LabelAssociationCha
 	if payload == nil {
 		return
 	}
-	forwardLabelEventAsync(ctx, eventTypeLabelAssociation, payload, ts, deviceID)
+	forwardAppStateEventAsync(ctx, eventTypeLabelAssociation, payload, ts, deviceID)
 }
 
-func forwardLabelEventAsync(ctx context.Context, eventName string, payload map[string]any, ts time.Time, deviceID string) {
+// forwardAppStateEventAsync / forwardAppStateEventToWebhook are shared by
+// the label events and the chat.read_state event (event_read_state.go).
+func forwardAppStateEventAsync(ctx context.Context, eventName string, payload map[string]any, ts time.Time, deviceID string) {
 	go func() {
 		webhookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if err := forwardLabelEventToWebhook(webhookCtx, eventName, payload, ts, deviceID); err != nil {
+		if err := forwardAppStateEventToWebhook(webhookCtx, eventName, payload, ts, deviceID); err != nil {
 			log.Errorf("Failed to forward %s event to webhook: %v", eventName, err)
 		}
 	}()
 }
 
-func forwardLabelEventToWebhook(ctx context.Context, eventName string, payload map[string]any, ts time.Time, deviceID string) error {
+func forwardAppStateEventToWebhook(ctx context.Context, eventName string, payload map[string]any, ts time.Time, deviceID string) error {
 	body := map[string]any{
 		"event":     eventName,
 		"timestamp": labelEventTimestamp(ts),

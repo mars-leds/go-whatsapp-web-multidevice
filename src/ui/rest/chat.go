@@ -26,6 +26,7 @@ func InitRestChat(app fiber.Router, service domainChat.IChatUsecase) Chat {
 	app.Post("/chat/:chat_jid/history", rest.RequestChatHistory)
 	// Fork-specific: apply/remove a WhatsApp label on a chat (see FORK_CHANGES.md).
 	app.Post("/chat/:chat_jid/label", rest.LabelChat)
+	app.Post("/chat/:chat_jid/unread", rest.UnreadChat)
 
 	return rest
 }

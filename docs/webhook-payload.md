@@ -25,6 +25,7 @@ The following events can be received via webhook:
 | `group.joined`       | You were added to a group                               |
 | `label.edit`         | WhatsApp label metadata changed                         |
 | `label.association`  | Label applied to or removed from a chat                 |
+| `chat.read_state`    | Chat marked as read/unread from the chat list (fork)    |
 | `newsletter.joined`  | You subscribed to a newsletter/channel                  |
 | `newsletter.left`    | You unsubscribed from a newsletter                      |
 | `newsletter.message` | New message(s) posted in a newsletter                   |
@@ -189,7 +190,7 @@ All webhook payloads follow a consistent top-level structure:
 
 | **Field**    | **Type** | **Description**                                                                                                     |
 |--------------|----------|---------------------------------------------------------------------------------------------------------------------|
-| `event`      | string   | Event type: `message`, `message.reaction`, `message.revoked`, `message.edited`, `message.ack`, `message.deleted`, `chat_presence`, `group.participants`, `group.joined`, `label.edit`, `label.association`, `newsletter.joined`, `newsletter.left`, `newsletter.message`, `newsletter.mute`, `call.offer` |
+| `event`      | string   | Event type: `message`, `message.reaction`, `message.revoked`, `message.edited`, `message.ack`, `message.deleted`, `chat_presence`, `group.participants`, `group.joined`, `label.edit`, `label.association`, `chat.read_state`, `newsletter.joined`, `newsletter.left`, `newsletter.message`, `newsletter.mute`, `call.offer` |
 | `device_id`  | string   | JID of the device that received this event (e.g., `628123456789@s.whatsapp.net`)                                    |
 | `session_id` | string   | Session ID registered via `POST /devices` (e.g., `org_2`), for correlating the event back to a tenant. Omitted when the JID can't be mapped to a session. |
 | `payload`    | object   | Event-specific payload data                                                                                         |
@@ -631,6 +632,40 @@ Triggered when a chat-level label is applied to or removed from a chat.
 | `payload.labeled`        | boolean  | Whether the label was applied (`true`) or removed (`false`) on `label.association` |
 | `payload.chat_id`        | string   | Chat JID associated with the label on `label.association`                         |
 | `payload.chat_lid`       | string   | Original LID chat identifier when WhatsApp supplied a LID before normalization    |
+
+## Chat Read State Events (fork)
+
+`chat.read_state` is emitted when a whole chat is marked as **read** or **unread** from the chat list on the phone or
+another linked device (the "Mark as unread" / "Mark as read" entries), and when this instance writes the same mutation
+through `POST /chat/{chat_jid}/unread` (the phone echoes it back, one event per index key written). It is an app-state
+event (`markChatAsRead` in the `regular_low` collection), not a receipt: opening a chat and reading its messages
+produces `message.ack` receipts, not this event. Full-sync replays are not forwarded.
+
+```json
+{
+  "event": "chat.read_state",
+  "device_id": "628123456789@s.whatsapp.net",
+  "timestamp": "2026-11-04T15:04:05Z",
+  "payload": {
+    "chat_id": "6289685028129@s.whatsapp.net",
+    "chat_lid": "223754944819424@lid",
+    "read": false,
+    "last_message_timestamp": "2026-11-04T15:03:40Z",
+    "last_message_id": "3EB0C767D26A1D8E4F1A"
+  }
+}
+```
+
+| **Field**                        | **Type** | **Description**                                                                 |
+|----------------------------------|----------|---------------------------------------------------------------------------------|
+| `event`                          | string   | `"chat.read_state"`                                                             |
+| `device_id`                      | string   | JID of the device that received this event                                      |
+| `timestamp`                      | string   | RFC3339 time of the marking (app-state mutation timestamp; processing time when missing) |
+| `payload.chat_id`                | string   | Chat JID, resolved to the phone number when the mutation was written under a LID |
+| `payload.chat_lid`               | string   | The LID the mutation was written under, when it was (omitted otherwise)         |
+| `payload.read`                   | boolean  | `true` = marked as read, `false` = marked as unread                             |
+| `payload.last_message_timestamp` | string   | RFC3339 time of the newest message the marker refers to (omitted when absent)   |
+| `payload.last_message_id`        | string   | Id of that message when the mutation carries its key (omitted otherwise)        |
 
 ## Group Events
 

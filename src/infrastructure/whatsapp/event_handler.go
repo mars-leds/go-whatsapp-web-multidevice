@@ -76,6 +76,9 @@ func handler(ctx context.Context, instance *DeviceInstance, rawEvt any) {
 		handleLabelEdit(ctx, evt, instance.JID(), client)
 	case *events.LabelAssociationChat:
 		handleLabelAssociation(ctx, evt, instance.JID(), client)
+	case *events.MarkChatAsRead:
+		// Fork-specific: chat.read_state webhook (see event_read_state.go).
+		handleMarkChatAsRead(ctx, evt, instance.JID(), client)
 	case *events.GroupInfo:
 		handleGroupInfo(ctx, evt, instance.JID(), client)
 	case *events.JoinedGroup:

@@ -3206,6 +3206,89 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
 
+  /chat/{chat_jid}/unread:
+    post:
+      operationId: unreadChat
+      tags:
+        - chat
+      summary: Mark a chat as unread or read (fork)
+      description: |
+        Fork-specific endpoint. Marks a chat as unread (default) or read on
+        the account's own devices, the way the phone's "Mark as unread" /
+        "Mark as read" chat-list entries do: an app state patch (whatsmeow
+        `appstate.BuildMarkChatAsRead`, collection `regular_low`, index
+        `markChatAsRead`), the same mechanism `/chat/{chat_jid}/pin` and
+        `/chat/{chat_jid}/archive` use.
+
+        This is not a read receipt. `POST /message/{message_id}/read` tells
+        the *sender* their messages were read; this endpoint only moves the
+        unread marker the phone shows in its chat list ("Unread" filter).
+        Typical use: send the read receipts, reply, then mark the chat
+        unread so a human finds it later.
+
+        The mutation carries a message range pointing at the newest message
+        stored for the chat in this instance's chat storage (timestamp +
+        key); when none is stored the range is the request time with no
+        key. The phone echoes the mutation back and this instance emits a
+        `chat.read_state` webhook event for it.
+
+        Index form: `jid_form` selects whether the mutation is written
+        under the phone-number JID (`pn`, default), the chat's LID (`lid`)
+        or both in one patch (`both`). Without a known LID every form
+        writes the phone number. The response reports a LID in `chat_lid`
+        when one was written.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - in: path
+          name: chat_jid
+          schema:
+            type: string
+          required: true
+          description: Chat JID (e.g., phone@s.whatsapp.net for individual or groupid@g.us for group). Percent-encoded values (e.g., groupid%40g.us) are accepted.
+          example: '6289685028129@s.whatsapp.net'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                unread:
+                  type: boolean
+                  default: true
+                  example: true
+                  description: true marks the chat unread, false marks it read (via app state, not receipts). Defaults to true when the body is empty.
+                jid_form:
+                  type: string
+                  enum: [pn, lid, both]
+                  default: pn
+                  description: Index key form to write the mutation under. See description.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnreadChatResponse'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorUnauthorized'
+        '500':
+          description: Internal Server Error (e.g. WhatsApp rejected the app state patch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+
   /labels:
     get:
       operationId: listLabels
@@ -6452,6 +6535,43 @@ components:
             labeled:
               type: boolean
               example: true
+    UnreadChatResponse:
+      type: object
+      properties:
+        code:
+          type: string
+          example: SUCCESS
+        message:
+          type: string
+          example: Chat marked as unread successfully
+        results:
+          type: object
+          properties:
+            status:
+              type: string
+              example: success
+            message:
+              type: string
+              example: Chat marked as unread successfully
+            chat_jid:
+              type: string
+              example: '6289685028129@s.whatsapp.net'
+            chat_lid:
+              type: string
+              description: The chat's LID when the mutation was written under it (jid_form lid/both with a known LID). Omitted otherwise.
+              example: '223754944819424@lid'
+            unread:
+              type: boolean
+              example: true
+            last_message_timestamp:
+              type: string
+              format: date-time
+              description: RFC3339 time of the newest stored message of the chat (the range sent), or the request time when none is stored.
+              example: '2026-11-04T15:04:05Z'
+            last_message_id:
+              type: string
+              description: Id of that message (the key sent in the range). Omitted when the chat has no stored message.
+              example: '3EB0C767D26A1D8E4F1A'
     Label:
       type: object
       description: A WhatsApp (Business) label as last seen in the `regular` app state collection. Field names match the `label.edit` webhook payload.

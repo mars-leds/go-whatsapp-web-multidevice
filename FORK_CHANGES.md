@@ -2,10 +2,12 @@
 
 This fork of
 [`aldinokemal/go-whatsapp-web-multidevice`](https://github.com/aldinokemal/go-whatsapp-web-multidevice)
-adds three features: the [`media-retry`](#media-retry-endpoint)
-endpoint, the [`chat label`](#chat-label-endpoint) endpoint and the
+adds four features: the [`media-retry`](#media-retry-endpoint)
+endpoint, the [`chat label`](#chat-label-endpoint) endpoint, the
 [labels API](#labels-api) (`GET/POST /labels`, `PUT/DELETE
-/labels/{label_id}`, typed label webhooks). All follow the same rules: new
+/labels/{label_id}`, typed label webhooks) and the
+[`chat unread`](#chat-unread-endpoint) endpoint (+ `chat.read_state`
+webhook). All follow the same rules: new
 files for the feature, minimal edits to upstream files marked with
 `// Fork-specific:` comments, documented in `docs/openapi.yaml`.
 
@@ -259,6 +261,108 @@ Successful response:
   state sync key (whatsmeow TODO). If the session has no synced keys yet
   (fresh pairing, before the first `regular` sync) it fails with
   `no app state keys found`; retry after the initial sync.
+
+# `chat unread` endpoint
+
+Adds `POST /chat/{chat_jid}/unread` (mark a chat as unread, or read, on
+the account's own devices) and the `chat.read_state` webhook event.
+
+## Why
+
+A bot that answers on a shared Business account reads the chat (read
+receipts, so the customer sees the blue ticks) and replies; afterwards the
+chat looks "handled" in the phone's chat list. The humans sharing the
+account want the opposite: every chat the bot touched should show up in
+the phone's **Unread** filter so they review it without hunting for
+labels. WhatsApp has that as the "Mark as unread" chat-list entry, which
+is an app state mutation (`markChatAsRead`, `regular_low` collection),
+not a receipt. whatsmeow builds it (`appstate.BuildMarkChatAsRead`) and
+emits `*events.MarkChatAsRead` when another device uses it, but upstream
+gowa exposes neither.
+
+## What's added (files)
+
+| File | Change | Purpose |
+| --- | --- | --- |
+| `src/domains/chat/chat_unread.go` | new | `UnreadChatRequest` / `UnreadChatResponse`, `jid_form` constants. |
+| `src/domains/chat/interfaces.go` | +3 lines | `UnreadChat` on `IChatUsecase`. |
+| `src/validations/chat_unread_validation.go` | new | `chat_jid` required, `jid_form` in {pn, lid, both}. |
+| `src/usecase/chat_unread.go` | new | Resolves the JID, looks up the chat's newest stored message, builds and sends the patch under the per-device app state mutex. |
+| `src/ui/rest/chat_unread.go` | new | Fiber handler (empty body allowed). |
+| `src/ui/rest/chat.go` | +1 line | Route. |
+| `src/infrastructure/whatsapp/event_read_state.go` | new | `chat.read_state` webhook from `*events.MarkChatAsRead` (skips `FromFullSync`). |
+| `src/infrastructure/whatsapp/event_handler.go` | +3 lines | Routes the event. |
+| `src/infrastructure/whatsapp/event_label.go` | rename | The async webhook helpers are now `forwardAppStateEvent*` (shared). |
+| `docs/openapi.yaml`, `docs/webhook-payload.md` | updated | Path, `UnreadChatResponse`, event docs. |
+| `*_test.go` next to each file | new | Validation, index-key selection, patch shape vs whatsmeow, last-message lookup (sqlite in memory), handler, payload + forwarder. |
+
+## How it works
+
+1. `POST /chat/{chat_jid}/unread` with an optional body
+   `{"unread": true|false, "jid_form": "pn"|"lid"|"both"}` (empty body =
+   unread, `pn`).
+2. The usecase validates, resolves the JID (an `@lid` input is resolved to
+   its number), takes the per-device app state write mutex (the one the
+   labels API uses), and looks up the newest message stored for the chat
+   and this device (`GetMessages` limit 1, by number first, by LID second).
+3. It builds `appstate.BuildMarkChatAsRead(jid, read=!unread, ts, key)`
+   per index key (`jid_form`) into one `regular_low` patch and sends it
+   with `SendAppState`. Without a stored message the range is "now" with
+   no key (whatsmeow's own default).
+4. The phone applies it, echoes the mutation back, and whatsmeow
+   dispatches `*events.MarkChatAsRead`, which `event_read_state.go` turns
+   into a `chat.read_state` webhook (`{chat_id, chat_lid?, read,
+   last_message_timestamp?, last_message_id?}`; LID resolved to number as
+   in `label.association`). Full-sync replays are skipped.
+
+Read receipts are untouched: `POST /message/{id}/read` still sends them
+and they still surface as `message.ack`.
+
+## HTTP status map
+
+| Code | When |
+| --- | --- |
+| 200 | OK. |
+| 400 | Malformed JSON, bad `chat_jid`, `jid_form` outside {pn, lid, both}. |
+| 401 | Basic auth. |
+| 500 | Not logged in, `SendAppState` rejected (patch error, no app state keys, LTHash mismatch). |
+
+## Example
+
+```bash
+curl -u "$GOWA_USER:$GOWA_PASS" -X POST \
+  "https://gowa.example.com/chat/6289685028129@s.whatsapp.net/unread" \
+  -H "X-Device-Id: MARS_IA"
+```
+
+```json
+{
+  "code": "SUCCESS",
+  "message": "Chat marked as unread successfully",
+  "results": {
+    "status": "success",
+    "message": "Chat marked as unread successfully",
+    "chat_jid": "6289685028129@s.whatsapp.net",
+    "unread": true,
+    "last_message_timestamp": "2026-11-04T15:03:40Z",
+    "last_message_id": "3EB0C767D26A1D8E4F1A"
+  }
+}
+```
+
+## Known limitations / edge cases
+
+- **Index form.** See the dev notes below for which `jid_form` the phone
+  honours; the default is the one that worked on the dev account.
+- **The marker is per account, not per device**: marking unread from the
+  API clears on every linked device when any of them opens the chat.
+- **The range is only as good as the chat storage**: a chat with no stored
+  message gets a "now" range with no key, which the phone accepts but
+  may place the marker differently.
+- **`unread: false` is not a read receipt.** It clears the marker locally;
+  the sender's ticks do not change. Use `POST /message/{id}/read` for that.
+- **Own writes echo back** as `chat.read_state` (one per index key), like
+  the label writes do; consumers should treat the event as idempotent.
 
 # Labels API
 
