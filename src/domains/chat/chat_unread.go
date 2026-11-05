@@ -35,6 +35,12 @@ type UnreadChatRequest struct {
 	// write because the local copy of the collection drifted (409 /
 	// mismatching LTHash); this flag is the manual repair.
 	Resync bool `json:"resync"`
+	// Recover forces an app state recovery request to the main phone for
+	// `regular_low` before writing (also `?recover=true`). The usecase does
+	// it on its own when the full sync itself fails LTHash verification
+	// (tulir/whatsmeow#858). WhatsApp must be open on the main phone; one
+	// request per device and collection every 10 minutes.
+	Recover bool `json:"recover"`
 }
 
 type UnreadChatResponse struct {
@@ -55,4 +61,8 @@ type UnreadChatResponse struct {
 	// Resynced is true when the `regular_low` collection was fully resynced
 	// during this call (requested or triggered by a rejected write).
 	Resynced bool `json:"resynced,omitempty"`
+	// Recovered is true when the main phone answered a recovery request
+	// for `regular_low` during this call (requested or triggered by a full
+	// sync that failed LTHash verification).
+	Recovered bool `json:"recovered,omitempty"`
 }

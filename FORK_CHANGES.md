@@ -289,6 +289,7 @@ gowa exposes neither.
 | `src/validations/chat_unread_validation.go` | new | `chat_jid` required, `jid_form` in {pn, lid, both}. |
 | `src/usecase/chat_unread.go` | new | Resolves the JID, looks up the chat's newest stored message, builds and sends the patch under the per-device app state mutex; full-syncs `regular_low` and retries once when the write is rejected as out of sync (or on `resync: true`). |
 | `src/infrastructure/whatsapp/appstate_resync.go` | new | `IsAppStateOutOfSync` (409 / mismatching LTHash) and `FullSyncAppState` (reset + snapshot of one collection, no events). |
+| `src/infrastructure/whatsapp/appstate_recovery.go` | new | `RequestAppStateRecovery`: recovery copy of one collection from the main phone (`BuildAppStateRecoveryRequest` + `SendPeerMessage`, waits for `AppStateSyncComplete{Recovery: true}`), 15 s timeout, one request per device and collection every 10 min. |
 | `src/ui/rest/chat_unread.go` | new | Fiber handler (empty body allowed). |
 | `src/ui/rest/chat.go` | +1 line | Route. |
 | `src/infrastructure/whatsapp/event_read_state.go` | new | `chat.read_state` webhook from `*events.MarkChatAsRead` (skips `FromFullSync`). |
@@ -300,8 +301,9 @@ gowa exposes neither.
 ## How it works
 
 1. `POST /chat/{chat_jid}/unread` with an optional body
-   `{"unread": true|false, "jid_form": "pn"|"lid"|"both", "resync": bool}`
-   (empty body = unread, `pn`, no forced resync; `?resync=true` works too).
+   `{"unread": true|false, "jid_form": "pn"|"lid"|"both", "resync": bool,
+   "recover": bool}` (empty body = unread, `pn`, no forced repair;
+   `?resync=true` / `?recover=true` work too).
 2. The usecase validates, resolves the JID (an `@lid` input is resolved to
    its number), takes the per-device app state write mutex (the one the
    labels API uses), and looks up the newest message stored for the chat
@@ -312,7 +314,10 @@ gowa exposes neither.
    no key (whatsmeow's own default).
    If the server rejects the write as out of sync (see "Drifted
    `regular_low`" below) the usecase full-syncs the collection and retries
-   once; with `resync: true` the full sync runs before the first attempt.
+   once; if the full sync itself does not verify, or the retry is still
+   rejected, it asks the main phone for a recovery copy and retries one
+   last time. `resync: true` / `recover: true` run the matching repair
+   before the first attempt.
 4. The phone applies it, echoes the mutation back, and whatsmeow
    dispatches `*events.MarkChatAsRead`, which `event_read_state.go` turns
    into a `chat.read_state` webhook (`{chat_id, chat_lid?, read,
@@ -329,7 +334,7 @@ and they still surface as `message.ack`.
 | 200 | OK. |
 | 400 | Malformed JSON, bad `chat_jid`, `jid_form` outside {pn, lid, both}. |
 | 401 | Basic auth. |
-| 500 | Not logged in, `SendAppState` rejected (patch error, no app state keys), or rejected as out of sync even after the automatic resync + retry. The message is whatsmeow's full error text (it is what tells a drifted collection from anything else). |
+| 500 | Not logged in, `SendAppState` rejected (patch error, no app state keys), or rejected as out of sync even after the automatic resync / recovery + retries. The message is whatsmeow's full error text (it is what tells a drifted collection from anything else), with the failed repair appended: `... requested 42s ago, retry in 9m18s` when the recovery request is rate limited, `... WhatsApp must be open on the main phone` when the phone did not answer in 15 s. |
 
 ## Example
 
@@ -354,8 +359,8 @@ curl -u "$GOWA_USER:$GOWA_PASS" -X POST \
 }
 ```
 
-`"resynced": true` appears in `results` when the collection was fully
-resynced during the call.
+`"resynced": true` / `"recovered": true` appear in `results` when the
+collection was fully resynced / recovered from the phone during the call.
 
 ## Drifted `regular_low` (old accounts)
 
@@ -386,6 +391,52 @@ is logged with device, collection and previous local version, and the
 response carries `resynced: true`. `resync: true` forces it before the
 first attempt (manual repair). If the retry fails too, the 500 carries
 whatsmeow's full error text, untouched.
+
+### When the full sync does not verify either: recovery from the phone
+
+On SOPORTE_FABIAN the full sync failed the same way (`failed to verify
+snapshot: failed to verify patch v352: mismatching LTHash`): the server's
+own snapshot does not verify against the app state keys this device has.
+That is [tulir/whatsmeow#858](https://github.com/tulir/whatsmeow/issues/858)
+(duplicates #813 / #508 / #518 / #651): old accounts, rotated app state
+keys, LID migrations. The maintainer's recommendation (2026-06) is, in
+order: (1) full sync; (2) if it still fails, ask the main phone for a
+recovery copy of the collection with
+`client.SendPeerMessage(ctx, whatsmeow.BuildAppStateRecoveryRequest(name))`;
+the phone answers with an unencrypted copy that whatsmeow applies on its
+own (`handleAppStateRecovery`: resets the local version, stores the
+phone's LTHash and MACs) and then emits
+`events.AppStateSyncComplete{Name: name, Recovery: true}`; (3) as a last
+resort `BuildFatalAppStateExceptionNotification`, which **unlinks every
+device**: the fork never sends it.
+
+`RequestAppStateRecovery` (`appstate_recovery.go`) implements step 2 for
+any collection: it resets the local version first (whatsmeow ignores a
+recovery answer whose version is not newer than the local one), registers
+a temporary event handler for the `Recovery: true` completion, sends the
+peer message and waits up to **15 s**. The usecase calls it when the full
+sync fails with `ErrMismatchingLTHash` or when the write is still rejected
+after a successful full sync, then retries the write once more;
+`recover: true` forces it before the first attempt.
+
+Operational requirements:
+
+- **WhatsApp must be open on the main phone.** With the app in the
+  foreground the answer takes about a second; with it closed it may never
+  come, and the call fails after 15 s with a message that says so. A write
+  that still fails after that is a 500 with whatsmeow's full text plus the
+  failed repair.
+- **One recovery request per device and collection every 10 minutes**, so
+  a retry loop cannot spam the phone. Inside that window the call fails
+  with `... requested 42s ago, retry in 9m18s` and sends nothing (a request
+  that could not be sent at all, e.g. offline, does not consume the
+  budget).
+- If the phone never answers, the collection is left at local version 0,
+  which only means whatsmeow's next sync of it is a full one (as it
+  already was).
+- The mechanism takes the collection as a parameter, so the day `regular`
+  (labels) drifts the same way it can be wired into the label writes; for
+  now only this endpoint uses it.
 
 Notes:
 

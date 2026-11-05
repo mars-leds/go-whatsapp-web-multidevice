@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -68,7 +69,8 @@ func (service serviceChat) UnreadChat(ctx context.Context, request domainChat.Un
 	lastTS, lastKey, lastID := service.lastMessageRange(deviceID, targetJID, lid)
 	patch := buildMarkChatAsReadPatch(indexJIDs, !unread, lastTS, lastKey)
 
-	resynced, err := sendAppStateWithResync(ctx, request.Resync,
+	repair, err := writeAppStateWithRepair(ctx,
+		appStateRepairOptions{ForceResync: request.Resync, ForceRecover: request.Recover},
 		func(ctx context.Context) error { return client.SendAppState(ctx, patch) },
 		func(ctx context.Context) error {
 			previous, err := whatsapp.FullSyncAppState(ctx, client, appstate.WAPatchRegularLow)
@@ -79,13 +81,24 @@ func (service serviceChat) UnreadChat(ctx context.Context, request domainChat.Un
 				"chat_jid":         request.ChatJID,
 			}).Info("Full resync of app state collection for mark chat as read")
 			return err
+		},
+		func(ctx context.Context) error {
+			version, err := whatsapp.RequestAppStateRecovery(ctx, client, deviceID, appstate.WAPatchRegularLow)
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"device_id":  deviceID,
+				"collection": appstate.WAPatchRegularLow,
+				"version":    version,
+				"chat_jid":   request.ChatJID,
+			}).Info("App state recovery from the main phone for mark chat as read")
+			return err
 		})
 	if err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{
 			"chat_jid":   request.ChatJID,
 			"index_jids": indexJIDs,
 			"unread":     unread,
-			"resynced":   resynced,
+			"resynced":   repair.Resynced,
+			"recovered":  repair.Recovered,
 		}).Error("Failed to send mark chat as read app state")
 		return response, err
 	}
@@ -104,7 +117,8 @@ func (service serviceChat) UnreadChat(ctx context.Context, request domainChat.Un
 	response.Unread = unread
 	response.LastMessageTimestamp = lastTS.UTC().Format(time.RFC3339)
 	response.LastMessageID = lastID
-	response.Resynced = resynced
+	response.Resynced = repair.Resynced
+	response.Recovered = repair.Recovered
 	if unread {
 		response.Message = "Chat marked as unread successfully"
 	} else {
@@ -116,35 +130,93 @@ func (service serviceChat) UnreadChat(ctx context.Context, request domainChat.Un
 		"chat_lid":        response.ChatLID,
 		"unread":          unread,
 		"last_message_id": lastID,
-		"resynced":        resynced,
+		"resynced":        repair.Resynced,
+		"recovered":       repair.Recovered,
 	}).Info("Chat unread operation completed successfully")
 
 	return response, nil
 }
 
-// sendAppStateWithResync runs send and, when the server rejects the write
-// because the local copy of the collection drifted (409 / mismatching
-// LTHash, see whatsapp.IsAppStateOutOfSync), full-syncs the collection and
-// retries send exactly once. With force the resync happens before the
-// first send (manual repair). It reports whether a resync ran. The error of
-// a failed retry is returned whole, as whatsmeow built it, since that text
-// is what tells a drifted collection from any other rejection.
-func sendAppStateWithResync(ctx context.Context, force bool, send, resync func(context.Context) error) (resynced bool, err error) {
-	if force {
-		if err = resync(ctx); err != nil {
-			return false, err
+// appStateRepairOptions are the manual repairs a request can force before
+// the write (body / query flags `resync` and `recover`).
+type appStateRepairOptions struct {
+	ForceResync  bool
+	ForceRecover bool
+}
+
+// appStateRepairResult reports which repairs ran during a write.
+type appStateRepairResult struct {
+	Resynced  bool
+	Recovered bool
+}
+
+// writeAppStateWithRepair runs send and repairs the collection when the
+// server rejects the write because the local copy drifted (409 /
+// mismatching LTHash, see whatsapp.IsAppStateOutOfSync), in the order the
+// whatsmeow maintainer recommends (tulir/whatsmeow#858):
+//
+//  1. full sync of the collection (resync), then one retry of send;
+//  2. if the full sync itself fails LTHash verification, or the retry is
+//     still rejected as out of sync, a recovery copy from the main phone
+//     (recover), then one last retry of send.
+//
+// ForceResync / ForceRecover run the matching repair before the first
+// send (manual repair); a repair that already ran is never repeated in the
+// same call. The final error is returned whole, as whatsmeow built it, with
+// the failed repair appended, since that text is what tells a drifted
+// collection from any other rejection.
+func writeAppStateWithRepair(ctx context.Context, opts appStateRepairOptions, send, resync, recover func(context.Context) error) (result appStateRepairResult, err error) {
+	var resyncErr error
+	if opts.ForceResync {
+		if resyncErr = resync(ctx); resyncErr == nil {
+			result.Resynced = true
+		} else if !opts.ForceRecover || !errors.Is(resyncErr, appstate.ErrMismatchingLTHash) {
+			return result, resyncErr
 		}
-		resynced = true
+		// else: the forced recovery below is exactly what repairs a full
+		// sync that does not verify.
 	}
+	if opts.ForceRecover {
+		if err = recover(ctx); err != nil {
+			if resyncErr != nil {
+				err = fmt.Errorf("%w (also, the app state recovery failed: %w)", resyncErr, err)
+			}
+			return result, err
+		}
+		result.Recovered = true
+	}
+
 	err = send(ctx)
-	if err == nil || resynced || !whatsapp.IsAppStateOutOfSync(err) {
-		return resynced, err
+	if err == nil || !whatsapp.IsAppStateOutOfSync(err) {
+		return result, err
 	}
-	logrus.WithError(err).Warn("App state write rejected as out of sync, full-syncing the collection and retrying once")
-	if resyncErr := resync(ctx); resyncErr != nil {
-		return false, fmt.Errorf("%w (also, the full resync of the collection failed: %w)", err, resyncErr)
+
+	if !result.Resynced && !result.Recovered {
+		logrus.WithError(err).Warn("App state write rejected as out of sync, full-syncing the collection and retrying once")
+		if resyncErr = resync(ctx); resyncErr != nil {
+			err = fmt.Errorf("%w (also, the full resync of the collection failed: %w)", err, resyncErr)
+			if !errors.Is(resyncErr, appstate.ErrMismatchingLTHash) {
+				return result, err
+			}
+			// The server's own snapshot does not verify: only the phone's
+			// copy can fix that.
+		} else {
+			result.Resynced = true
+			if err = send(ctx); err == nil || !whatsapp.IsAppStateOutOfSync(err) {
+				return result, err
+			}
+		}
 	}
-	return true, send(ctx)
+	if result.Recovered {
+		return result, err
+	}
+
+	logrus.WithError(err).Warn("App state collection still out of sync after the full sync, asking the main phone for a recovery copy and retrying once")
+	if recoverErr := recover(ctx); recoverErr != nil {
+		return result, fmt.Errorf("%w (also, the app state recovery failed: %w)", err, recoverErr)
+	}
+	result.Recovered = true
+	return result, send(ctx)
 }
 
 // unreadChatIndexJIDs picks the `markChatAsRead` index keys to write for the

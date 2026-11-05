@@ -10,9 +10,10 @@ import (
 // UnreadChat handles POST /chat/:chat_jid/unread (fork-specific).
 //
 // Body (optional): {"unread": true|false, "jid_form": "pn"|"lid"|"both",
-// "resync": true|false}. An empty body means unread=true. `?resync=true` in
-// the query is the same as the body flag. The route chat_jid is
-// authoritative; a body chat_jid never overrides it.
+// "resync": true|false, "recover": true|false}. An empty body means
+// unread=true. `?resync=true` / `?recover=true` in the query are the same
+// as the body flags. The route chat_jid is authoritative; a body chat_jid
+// never overrides it.
 func (controller *Chat) UnreadChat(c fiber.Ctx) error {
 	var request domainChat.UnreadChatRequest
 
@@ -42,6 +43,9 @@ func (controller *Chat) UnreadChat(c fiber.Ctx) error {
 	request.ChatJID = chatJID
 	if c.Query("resync") == "true" {
 		request.Resync = true
+	}
+	if c.Query("recover") == "true" {
+		request.Recover = true
 	}
 
 	response, err := controller.Service.UnreadChat(whatsapp.ContextWithDevice(c.Context(), getDeviceFromCtx(c)), request)

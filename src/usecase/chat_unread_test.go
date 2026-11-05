@@ -11,6 +11,7 @@ import (
 	domainChat "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chat"
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatstorage"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -151,77 +152,189 @@ func TestUnreadChatRequiresClient(t *testing.T) {
 	assert.Equal(t, pkgError.ErrWaCLI, err)
 }
 
-func TestSendAppStateWithResync(t *testing.T) {
-	outOfSync := fmt.Errorf("%w (%s): %s", whatsmeow.ErrAppStateUpdate, appstate.WAPatchRegularLow, `<error code="409" text="conflict"/>`)
-	other := errors.New("no app state keys found, creating app state keys is not yet supported")
+// appStateRepairScript drives writeAppStateWithRepair with scripted
+// results: send errors are consumed in order (nil past the end), resync
+// and recover return their fixed error.
+type appStateRepairScript struct {
+	sendErrs   []error
+	resyncErr  error
+	recoverErr error
+	trace      []string
+	sends      int
+}
 
-	run := func(force bool, sendErrs []error, resyncErr error) (bool, error, []string) {
-		var trace []string
-		sends := 0
-		send := func(context.Context) error {
-			trace = append(trace, "send")
-			var err error
-			if sends < len(sendErrs) {
-				err = sendErrs[sends]
-			}
-			sends++
-			return err
-		}
-		resync := func(context.Context) error {
-			trace = append(trace, "resync")
-			return resyncErr
-		}
-		resynced, err := sendAppStateWithResync(context.Background(), force, send, resync)
-		return resynced, err, trace
+func (sc *appStateRepairScript) send(context.Context) error {
+	sc.trace = append(sc.trace, "send")
+	var err error
+	if sc.sends < len(sc.sendErrs) {
+		err = sc.sendErrs[sc.sends]
 	}
+	sc.sends++
+	return err
+}
 
-	// Happy path: one send, no resync.
-	resynced, err, trace := run(false, nil, nil)
-	assert.NoError(t, err)
-	assert.False(t, resynced)
-	assert.Equal(t, []string{"send"}, trace)
+func (sc *appStateRepairScript) resync(context.Context) error {
+	sc.trace = append(sc.trace, "resync")
+	return sc.resyncErr
+}
 
-	// Out of sync: resync, retry once, success.
-	resynced, err, trace = run(false, []error{outOfSync, nil}, nil)
-	assert.NoError(t, err)
-	assert.True(t, resynced)
-	assert.Equal(t, []string{"send", "resync", "send"}, trace)
+func (sc *appStateRepairScript) recover(context.Context) error {
+	sc.trace = append(sc.trace, "recover")
+	return sc.recoverErr
+}
 
-	// Out of sync twice: the retry's error comes back whole, no third try.
-	resynced, err, trace = run(false, []error{outOfSync, outOfSync}, nil)
-	assert.ErrorIs(t, err, whatsmeow.ErrAppStateUpdate)
-	assert.Equal(t, outOfSync, err, "retry error returned as whatsmeow built it")
-	assert.True(t, resynced)
-	assert.Equal(t, []string{"send", "resync", "send"}, trace)
+func (sc *appStateRepairScript) run(opts appStateRepairOptions) (appStateRepairResult, error) {
+	return writeAppStateWithRepair(context.Background(), opts, sc.send, sc.resync, sc.recover)
+}
 
-	// Out of sync and the resync itself fails: both errors, no retry.
-	resyncFailed := errors.New("full sync of app state regular_low failed: boom")
-	resynced, err, trace = run(false, []error{outOfSync}, resyncFailed)
-	assert.ErrorIs(t, err, whatsmeow.ErrAppStateUpdate)
-	assert.ErrorIs(t, err, resyncFailed)
-	assert.False(t, resynced)
-	assert.Equal(t, []string{"send", "resync"}, trace)
+func TestWriteAppStateWithRepair(t *testing.T) {
+	// The exact shapes whatsmeow produced on SOPORTE_FABIAN (2026-11-05).
+	outOfSync := fmt.Errorf("%w (%s): %s (also, applying patches in the response failed: %w)",
+		whatsmeow.ErrAppStateUpdate, appstate.WAPatchRegularLow, `<error code="409" text="conflict"/>`,
+		fmt.Errorf("failed to decode app state regular_low patches: failed to verify patch v188: %w", appstate.ErrMismatchingLTHash))
+	snapshotMismatch := fmt.Errorf("full sync of app state regular_low failed: failed to decode app state regular_low patches: failed to verify snapshot: failed to verify patch v352: %w", appstate.ErrMismatchingLTHash)
+	resyncOffline := errors.New("full sync of app state regular_low failed: websocket not connected")
+	other := errors.New("no app state keys found, creating app state keys is not yet supported")
+	rateLimited := fmt.Errorf("%w: regular_low for dev was requested 42s ago, retry in 9m18s", whatsapp.ErrAppStateRecoveryRateLimited)
+	none := appStateRepairOptions{}
 
-	// Any other rejection is returned as is, no resync.
-	resynced, err, trace = run(false, []error{other}, nil)
-	assert.Equal(t, other, err)
-	assert.False(t, resynced)
-	assert.Equal(t, []string{"send"}, trace)
+	t.Run("happy path", func(t *testing.T) {
+		sc := &appStateRepairScript{}
+		res, err := sc.run(none)
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{}, res)
+		assert.Equal(t, []string{"send"}, sc.trace)
+	})
 
-	// Forced: resync first, then one send; a rejection after a forced
-	// resync is not retried.
-	resynced, err, trace = run(true, nil, nil)
-	assert.NoError(t, err)
-	assert.True(t, resynced)
-	assert.Equal(t, []string{"resync", "send"}, trace)
-	resynced, err, trace = run(true, []error{outOfSync}, nil)
-	assert.Equal(t, outOfSync, err)
-	assert.True(t, resynced)
-	assert.Equal(t, []string{"resync", "send"}, trace)
+	t.Run("out of sync, full sync repairs it", func(t *testing.T) {
+		sc := &appStateRepairScript{sendErrs: []error{outOfSync, nil}}
+		res, err := sc.run(none)
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{Resynced: true}, res)
+		assert.Equal(t, []string{"send", "resync", "send"}, sc.trace)
+	})
 
-	// Forced and the resync fails: nothing is sent.
-	resynced, err, trace = run(true, nil, resyncFailed)
-	assert.Equal(t, resyncFailed, err)
-	assert.False(t, resynced)
-	assert.Equal(t, []string{"resync"}, trace)
+	t.Run("full sync does not verify, recovery repairs it", func(t *testing.T) {
+		sc := &appStateRepairScript{sendErrs: []error{outOfSync, nil}, resyncErr: snapshotMismatch}
+		res, err := sc.run(none)
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{Recovered: true}, res)
+		assert.Equal(t, []string{"send", "resync", "recover", "send"}, sc.trace)
+	})
+
+	t.Run("full sync ok but still rejected, recovery repairs it", func(t *testing.T) {
+		sc := &appStateRepairScript{sendErrs: []error{outOfSync, outOfSync, nil}}
+		res, err := sc.run(none)
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{Resynced: true, Recovered: true}, res)
+		assert.Equal(t, []string{"send", "resync", "send", "recover", "send"}, sc.trace)
+	})
+
+	t.Run("rejected even after recovery: whole error, no fourth try", func(t *testing.T) {
+		sc := &appStateRepairScript{sendErrs: []error{outOfSync, outOfSync, outOfSync}}
+		res, err := sc.run(none)
+		assert.Equal(t, outOfSync, err)
+		assert.Equal(t, appStateRepairResult{Resynced: true, Recovered: true}, res)
+		assert.Equal(t, []string{"send", "resync", "send", "recover", "send"}, sc.trace)
+	})
+
+	t.Run("full sync does not verify and recovery fails: both errors", func(t *testing.T) {
+		sc := &appStateRepairScript{sendErrs: []error{outOfSync}, resyncErr: snapshotMismatch, recoverErr: rateLimited}
+		res, err := sc.run(none)
+		assert.ErrorIs(t, err, whatsmeow.ErrAppStateUpdate)
+		assert.ErrorIs(t, err, snapshotMismatch)
+		assert.ErrorIs(t, err, whatsapp.ErrAppStateRecoveryRateLimited)
+		assert.Contains(t, err.Error(), "retry in 9m18s")
+		assert.Equal(t, appStateRepairResult{}, res)
+		assert.Equal(t, []string{"send", "resync", "recover"}, sc.trace)
+	})
+
+	t.Run("full sync fails for another reason: no recovery", func(t *testing.T) {
+		sc := &appStateRepairScript{sendErrs: []error{outOfSync}, resyncErr: resyncOffline}
+		res, err := sc.run(none)
+		assert.ErrorIs(t, err, whatsmeow.ErrAppStateUpdate)
+		assert.ErrorIs(t, err, resyncOffline)
+		assert.Equal(t, appStateRepairResult{}, res)
+		assert.Equal(t, []string{"send", "resync"}, sc.trace)
+	})
+
+	t.Run("other rejection: returned as is", func(t *testing.T) {
+		sc := &appStateRepairScript{sendErrs: []error{other}}
+		res, err := sc.run(none)
+		assert.Equal(t, other, err)
+		assert.Equal(t, appStateRepairResult{}, res)
+		assert.Equal(t, []string{"send"}, sc.trace)
+	})
+
+	t.Run("forced resync", func(t *testing.T) {
+		sc := &appStateRepairScript{}
+		res, err := sc.run(appStateRepairOptions{ForceResync: true})
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{Resynced: true}, res)
+		assert.Equal(t, []string{"resync", "send"}, sc.trace)
+
+		// Still rejected after a forced resync: recovery, once.
+		sc = &appStateRepairScript{sendErrs: []error{outOfSync, nil}}
+		res, err = sc.run(appStateRepairOptions{ForceResync: true})
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{Resynced: true, Recovered: true}, res)
+		assert.Equal(t, []string{"resync", "send", "recover", "send"}, sc.trace)
+
+		// Forced resync fails: nothing is sent.
+		sc = &appStateRepairScript{resyncErr: snapshotMismatch}
+		res, err = sc.run(appStateRepairOptions{ForceResync: true})
+		assert.Equal(t, snapshotMismatch, err)
+		assert.Equal(t, appStateRepairResult{}, res)
+		assert.Equal(t, []string{"resync"}, sc.trace)
+	})
+
+	t.Run("forced recover", func(t *testing.T) {
+		sc := &appStateRepairScript{}
+		res, err := sc.run(appStateRepairOptions{ForceRecover: true})
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{Recovered: true}, res)
+		assert.Equal(t, []string{"recover", "send"}, sc.trace)
+
+		// Rejected after a forced recovery: nothing else to try.
+		sc = &appStateRepairScript{sendErrs: []error{outOfSync}}
+		res, err = sc.run(appStateRepairOptions{ForceRecover: true})
+		assert.Equal(t, outOfSync, err)
+		assert.Equal(t, appStateRepairResult{Recovered: true}, res)
+		assert.Equal(t, []string{"recover", "send"}, sc.trace)
+
+		// Forced recovery fails (rate limited): nothing is sent.
+		sc = &appStateRepairScript{recoverErr: rateLimited}
+		res, err = sc.run(appStateRepairOptions{ForceRecover: true})
+		assert.Equal(t, rateLimited, err)
+		assert.Equal(t, appStateRepairResult{}, res)
+		assert.Equal(t, []string{"recover"}, sc.trace)
+	})
+
+	t.Run("forced resync and recover", func(t *testing.T) {
+		sc := &appStateRepairScript{}
+		res, err := sc.run(appStateRepairOptions{ForceResync: true, ForceRecover: true})
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{Resynced: true, Recovered: true}, res)
+		assert.Equal(t, []string{"resync", "recover", "send"}, sc.trace)
+
+		// The forced resync does not verify: the forced recovery still runs.
+		sc = &appStateRepairScript{resyncErr: snapshotMismatch}
+		res, err = sc.run(appStateRepairOptions{ForceResync: true, ForceRecover: true})
+		assert.NoError(t, err)
+		assert.Equal(t, appStateRepairResult{Recovered: true}, res)
+		assert.Equal(t, []string{"resync", "recover", "send"}, sc.trace)
+
+		// Both fail: both errors, nothing sent.
+		sc = &appStateRepairScript{resyncErr: snapshotMismatch, recoverErr: rateLimited}
+		_, err = sc.run(appStateRepairOptions{ForceResync: true, ForceRecover: true})
+		assert.ErrorIs(t, err, snapshotMismatch)
+		assert.ErrorIs(t, err, whatsapp.ErrAppStateRecoveryRateLimited)
+		assert.Equal(t, []string{"resync", "recover"}, sc.trace)
+
+		// The forced resync fails for another reason: stop there.
+		sc = &appStateRepairScript{resyncErr: resyncOffline}
+		_, err = sc.run(appStateRepairOptions{ForceResync: true, ForceRecover: true})
+		assert.Equal(t, resyncOffline, err)
+		assert.Equal(t, []string{"resync"}, sc.trace)
+	})
 }
