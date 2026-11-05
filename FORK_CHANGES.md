@@ -352,8 +352,20 @@ curl -u "$GOWA_USER:$GOWA_PASS" -X POST \
 
 ## Known limitations / edge cases
 
-- **Index form.** See the dev notes below for which `jid_form` the phone
-  honours; the default is the one that worked on the dev account.
+- **Index form (verified on a Business account, Nov 2026).** The phone
+  honours the phone-number form: `jid_form: pn` (the default) shows the
+  marker in the chat list and in the "Unread" filter. The phone itself
+  writes `markChatAsRead` under the chat's **LID** (its `read: true` when
+  the chat is opened arrives with `chat_lid`), so `lid` / `both` are kept
+  for the day the number form stops working.
+- **Verified behaviour (same account):** a read receipt sent through
+  `POST /message/{id}/read` does **not** clear the marker and emits no
+  `chat.read_state`; a message sent through the API **does** clear it on
+  the phone, silently (no app state event), so mark the chat unread
+  *after* replying; opening the chat on the phone emits
+  `chat.read_state` with `read: true` (so does switching away from an open
+  chat). The marker also works when the chat's last message is our own
+  outgoing one.
 - **The marker is per account, not per device**: marking unread from the
   API clears on every linked device when any of them opens the chat.
 - **The range is only as good as the chat storage**: a chat with no stored
