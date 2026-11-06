@@ -668,6 +668,19 @@ git fetch upstream
 git merge upstream/main   # or: git rebase upstream/main
 ```
 
+**whatsmeow bump without merging upstream (2026-11-06).** `src/go.mod`
+pins `go.mau.fi/whatsmeow v0.0.0-20261105212532-307a2edf117d` (upstream
+commit 307a2ed, 2026-11-05), ahead of upstream gowa, to pick up
+tulir/whatsmeow#1319 "appstate: don't fail patches on LTHash mismatch when
+patch MAC is valid": the support account's `regular` (labels) and
+`regular_low` (read/unread) collections stopped syncing with
+`mismatching LTHash` (tulir/whatsmeow#858), a fresh pairing hit the same
+patches again, and the phone never answered the recovery request. With the
+bump a patch whose MAC verifies is applied and the mismatch is only
+logged; snapshots stay strict. When merging upstream later, keep the newer
+of the two whatsmeow versions. (`go get go.mau.fi/whatsmeow@307a2edf117d &&
+go mod tidy`; x/net, x/sync, x/sys, x/text and x/exp moved with it.)
+
 All fork-specific code is isolated in new files; the only edits to
 upstream files are small and marked with `// Fork-specific:` comments,
 so conflicts should be rare.
